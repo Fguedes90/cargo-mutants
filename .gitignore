@@ -6,3 +6,4 @@ wiki
 .vscode/
 book/book
 *.snap.new
+.agent-scratch/
