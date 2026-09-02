@@ -44,6 +44,54 @@ pub struct Span {
     pub end: LineColumn,
 }
 
+/// Byte offsets of the start of every line in a string.
+///
+/// Resolving a [`LineColumn`] to a byte offset otherwise requires scanning from
+/// the start of the string. Doing that once per mutant makes discovery
+/// quadratic in file size, so callers that resolve many spans within one file
+/// build this once and share it.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LineIndex {
+    /// Byte offset of the first character of each line, in order.
+    line_starts: Vec<usize>,
+}
+
+impl LineIndex {
+    pub fn new(s: &str) -> LineIndex {
+        let mut line_starts = Vec::new();
+        line_starts.push(0);
+        line_starts.extend(s.match_indices('\n').map(|(i, _)| i + 1));
+        LineIndex { line_starts }
+    }
+
+    /// Byte offset of the first character at or after `pos`.
+    ///
+    /// Columns count characters rather than bytes, and a `\r` shares the column
+    /// of the character that follows it, matching how positions are counted
+    /// when they are derived from `proc_macro2`. A position beyond the end of
+    /// its line resolves to the start of the next line, and one beyond the end
+    /// of the string resolves to its length.
+    fn byte_offset(&self, s: &str, pos: LineColumn) -> usize {
+        let Some(line) = pos.line.checked_sub(1) else {
+            return 0;
+        };
+        let Some(&line_start) = self.line_starts.get(line) else {
+            return s.len();
+        };
+        let line_end = self.line_starts.get(line + 1).copied().unwrap_or(s.len());
+        let mut column = 1;
+        for (offset, c) in s[line_start..line_end].char_indices() {
+            if column >= pos.column {
+                return line_start + offset;
+            }
+            if c != '\r' {
+                column += 1;
+            }
+        }
+        line_end
+    }
+}
+
 impl Span {
     #[allow(dead_code)]
     pub fn quad(
@@ -64,71 +112,49 @@ impl Span {
         }
     }
 
-    /// Return the region of a multi-line string that this span covers.
-    pub fn extract(&self, s: &str) -> String {
-        let mut r = String::new();
-        let mut line_no = 1;
-        let mut col_no = 1;
-        let start = self.start;
-        let end = self.end;
-        for c in s.chars() {
-            if ((line_no == start.line && col_no >= start.column) || line_no > start.line)
-                && (line_no < end.line || (line_no == end.line && col_no < end.column))
-            {
-                r.push(c);
-            }
-            if c == '\n' {
-                line_no += 1;
-                if line_no > end.line {
-                    break;
-                }
-                col_no = 1;
-            } else if c == '\r' {
-                // counts as part of the last column, not a separate column
-            } else {
-                col_no += 1;
-            }
-            if line_no == end.line && col_no >= end.column {
-                break;
-            }
-        }
+    /// Return the region of a multi-line string that this span covers, using a
+    /// prebuilt line index.
+    pub fn extract_indexed(&self, s: &str, line_index: &LineIndex) -> String {
+        let (start, end) = self.byte_range(s, line_index);
+        s[start..end].to_owned()
+    }
+
+    /// Replace a subregion of text, using a prebuilt line index.
+    pub fn replace_indexed(&self, s: &str, line_index: &LineIndex, replacement: &str) -> String {
+        let (start, end) = self.byte_range(s, line_index);
+        let mut r = String::with_capacity(s.len() - (end - start) + replacement.len());
+        r.push_str(&s[..start]);
+        r.push_str(replacement);
+        r.push_str(&s[end..]);
         r
     }
 
-    /// Replace a subregion of text.
+    /// Resolve this span to a byte range within `s`.
     ///
-    /// Returns a copy of `s` with the region identified by this span replaced by
-    /// `replacement`.
+    /// The end is clamped to the start so that a reversed or degenerate span
+    /// yields an empty range rather than panicking.
+    fn byte_range(&self, s: &str, line_index: &LineIndex) -> (usize, usize) {
+        let start = line_index.byte_offset(s, self.start);
+        let end = line_index.byte_offset(s, self.end).max(start);
+        (start, end)
+    }
+}
+
+/// Single-span convenience wrappers.
+///
+/// Production code extracts many spans from one file and shares a [`LineIndex`]
+/// to keep that linear, so these one-shot forms are only used by tests.
+#[cfg(test)]
+impl Span {
+    /// Return the region of a multi-line string that this span covers.
+    pub fn extract(&self, s: &str) -> String {
+        self.extract_indexed(s, &LineIndex::new(s))
+    }
+
+    /// Returns a copy of `s` with the region identified by this span replaced
+    /// by `replacement`.
     pub fn replace(&self, s: &str, replacement: &str) -> String {
-        let mut r = String::with_capacity(s.len() + replacement.len());
-        let mut line_no = 1;
-        let mut col_no = 1;
-        let start = self.start;
-        let end = self.end;
-        for c in s.chars() {
-            if line_no == start.line && col_no == start.column {
-                r.push_str(replacement);
-            }
-            if line_no < start.line
-                || line_no > end.line
-                || (line_no == start.line && col_no < start.column)
-                || (line_no == end.line && col_no >= end.column)
-            {
-                r.push(c);
-            }
-            if c == '\n' {
-                line_no += 1;
-                col_no = 1;
-            } else if c == '\r' {
-                // counts as part of the last column, not a separate column
-            } else {
-                col_no += 1;
-            }
-        }
-        if line_no == start.line && col_no == start.column {
-            r.push_str(replacement);
-        }
-        r
+        self.replace_indexed(s, &LineIndex::new(s), replacement)
     }
 }
 

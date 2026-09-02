@@ -139,8 +139,9 @@ impl Mutant {
 
     /// Return text of the whole file with the mutation applied.
     pub fn mutated_code(&self) -> String {
-        self.span.replace(
+        self.span.replace_indexed(
             self.source_file.code(),
+            self.source_file.line_index(),
             &format!("{} {}", self.replacement, MUTATION_MARKER_COMMENT),
         )
     }
@@ -269,7 +270,8 @@ impl Mutant {
     }
 
     pub fn original_text(&self) -> String {
-        self.span.extract(self.source_file.code())
+        self.span
+            .extract_indexed(self.source_file.code(), self.source_file.line_index())
     }
 
     /// Return the text inserted for this mutation.

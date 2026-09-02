@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::package::Package;
 use crate::path::{Utf8PathSlashes, ascent};
-use crate::span::LineColumn;
+use crate::span::{LineColumn, LineIndex};
 
 /// A Rust source file within a source tree.
 ///
@@ -40,6 +40,12 @@ pub struct SourceFile {
     /// True if this is the top source file for its target: typically but
     /// not always `lib.rs` or `main.rs`.
     pub is_top: bool,
+
+    /// Byte offsets of each line in `code`.
+    ///
+    /// Cached alongside the text so that resolving the span of each mutant in
+    /// this file does not rescan it from the start.
+    line_index: Arc<LineIndex>,
 }
 
 #[allow(clippy::missing_fields_in_debug)] // intentional
@@ -80,9 +86,11 @@ impl SourceFile {
                 .with_context(|| format!("failed to read source of {full_path:?}"))?
                 .replace("\r\n", "\n"),
         );
+        let line_index = Arc::new(LineIndex::new(&code));
         Ok(Some(SourceFile {
             tree_relative_path: tree_relative_path.to_owned(),
             code,
+            line_index,
             package: Arc::new(package.clone()),
             is_top,
         }))
@@ -102,9 +110,12 @@ impl SourceFile {
         } else {
             vec!["src/lib.rs".into()]
         };
+        let code = Arc::new(code.to_owned());
+        let line_index = Arc::new(LineIndex::new(&code));
         SourceFile {
             tree_relative_path,
-            code: Arc::new(code.to_owned()),
+            code,
+            line_index,
             package: Arc::new(Package {
                 name: package_name.to_owned(),
                 relative_dir: Utf8PathBuf::new(),
@@ -126,6 +137,11 @@ impl SourceFile {
 
     pub fn code(&self) -> &str {
         self.code.as_str()
+    }
+
+    /// Byte offsets of each line in this file's text.
+    pub fn line_index(&self) -> &LineIndex {
+        &self.line_index
     }
 
     /// Format a location within this source file for display to the user
