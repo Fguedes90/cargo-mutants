@@ -6,14 +6,16 @@ use std::borrow::Cow;
 use std::fmt::Write;
 use std::fs::File;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use console::{StyledObject, style};
 use nutmeg::Destination;
-use tracing::Level;
+use tracing::{Level, Metadata};
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::{Context as LayerContext, Filter};
 use tracing_subscriber::prelude::*;
 
 use crate::options::Colors;
@@ -31,6 +33,12 @@ pub struct Console {
 
     /// The `mutants.out/debug.log` file, if it's open yet.
     debug_log: Arc<Mutex<Option<File>>>,
+
+    /// Whether [`Self::debug_log`] has been opened.
+    ///
+    /// Shared with the debug-log layer's filter so that the layer stays off,
+    /// and the global max level stays low, until there is somewhere to write.
+    debug_log_open: Arc<AtomicBool>,
 }
 
 impl Console {
@@ -38,6 +46,7 @@ impl Console {
         Console {
             view: Arc::new(nutmeg::View::new(LabModel::default(), nutmeg_options())),
             debug_log: Arc::new(Mutex::new(None)),
+            debug_log_open: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -228,6 +237,11 @@ impl Console {
     /// Set the debug log file.
     pub fn set_debug_log(&self, file: File) {
         *self.debug_log.lock().unwrap() = Some(file);
+        self.debug_log_open.store(true, Ordering::Release);
+        // The debug-log layer reported `OFF` while there was nowhere to write,
+        // so callsite interest was cached as "never". Recompute it now that the
+        // layer wants events again.
+        tracing::callsite::rebuild_interest_cache();
     }
 
     /// Configure tracing to send messages to the console and debug log.
@@ -244,7 +258,8 @@ impl Console {
             .with_file(true) // source file name
             .with_line_number(true)
             .with_timer(uptime)
-            .with_writer(self.make_debug_log_writer());
+            .with_writer(self.make_debug_log_writer())
+            .with_filter(DebugLogFilter(Arc::clone(&self.debug_log_open)));
         let level_filter = tracing_subscriber::filter::LevelFilter::from_level(console_trace_level);
         let console_layer = tracing_subscriber::fmt::layer()
             .with_ansi(stderr_colors)
@@ -331,6 +346,35 @@ impl std::io::Write for TerminalWriter {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// Enables the debug-log layer only once the debug log file has been opened.
+///
+/// The log is opened after the source tree has been walked, so until then the
+/// layer would format every event and hand it to a writer that discards it.
+/// Reporting `OFF` until then also keeps the global max level down, so the
+/// trace spans and events in the tree-walking hot path cost only a level check.
+#[derive(Clone)]
+struct DebugLogFilter(Arc<AtomicBool>);
+
+impl DebugLogFilter {
+    fn is_open(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+impl<S> Filter<S> for DebugLogFilter {
+    fn enabled(&self, _meta: &Metadata<'_>, _cx: &LayerContext<'_, S>) -> bool {
+        self.is_open()
+    }
+
+    fn max_level_hint(&self) -> Option<tracing_subscriber::filter::LevelFilter> {
+        if self.is_open() {
+            None
+        } else {
+            Some(tracing_subscriber::filter::LevelFilter::OFF)
+        }
     }
 }
 
