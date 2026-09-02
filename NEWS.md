@@ -22,6 +22,15 @@
 
 - Fixed: Support for Illumos, by updating to `fs4`.
 
+- Performance: Mutant discovery allocates much less. Each mutant's description
+  was built by assembling a dozen intermediate strings, `--list` cloned every
+  name before printing it, and the token pretty-printer allocated a separate
+  string for every level of nesting; all three now write into a single buffer.
+  The `release` profile also enables thin LTO and a single codegen unit, as the
+  release binaries published by `cargo dist` already did, which makes builds
+  from source slower but the resulting binary faster. Mutant discovery output
+  is byte-for-byte unchanged.
+
 ## 27.1.0
 
 Released 2026-06-02.

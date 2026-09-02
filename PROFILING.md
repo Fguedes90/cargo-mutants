@@ -102,6 +102,60 @@ metadata work, and `--offline` and `--frozen` do not change it. In what is left,
 `syn` parsing is 42% of a large-file discovery and the rest is spread across
 items no larger than ~9%.
 
+### A later pass: what is left after the allocation work
+
+A further pass profiled the tree again once the items above were fixed. The
+profile had changed shape completely: `malloc` was the single largest entry in
+self time (37.6% on a large single file, 59.8% aggregated across threads on a
+multi-file tree), so the remaining wins were about not allocating rather than
+about algorithmic complexity.
+
+| Change | Mechanism | Effect |
+|---|---|---|
+| Mutant descriptions are built through one callback | `describe_change` rendered the description by building a `Vec<StyledObject<String>>` and then a second `String` per part, ~12 allocations per mutant, only to concatenate them. The parts are now emitted to a callback as `&str`, so the plain rendering allocates only its output string; the coloured rendering styles the same parts, so the two cannot drift. | -8.6% of the three-fixture total |
+| `--list` writes names into the output buffer | `list_mutants` called `name(show_line_col)`, which cloned the cached name into a fresh `String` per mutant, and then copied it again into the output. It now appends directly. | included above |
+| The pretty-printer recurses into one buffer | `to_pretty_string` allocated a fresh `String::with_capacity(200)` for every nested token group and copied it into its parent, so a type like `Result<Option<Vec<String>>, E>` allocated once per level. Groups now write into the caller's buffer, with every spacing test made relative to the group's start offset so that group-local formatting — including the `Delimiter::None` case, which emits no opening character — is unchanged. | -2.6% |
+| `[profile.release]` gets `lto = "thin"`, `codegen-units = 1` | The stock release profile cannot inline across codegen units or into `syn`/`proc-macro2`, which is where most of the remaining time goes. | -2.7% |
+
+The lazy mutant name was also being forced for every candidate: `collect_mutant`
+passed `mutant.full_name()` as an argument to `excluded_by_attr_re`, so it was
+evaluated before that function could apply its cheap "no `exclude_re` in scope"
+test. The name is built only when an attribute is actually in scope now. This
+does not show in the `--list` benchmark, where the name is needed for output
+anyway, but it matters for runs that filter mutants out.
+
+Three changes were measured and **rejected**, which is worth recording so they
+are not tried again:
+
+- **`Mutant` holding `Arc<SourceFile>`** instead of cloning the `SourceFile`
+  (two path allocations) per mutant. Interleaved min-of-25: the large-file
+  workload improved by 1.2%, but the multi-file workloads got worse by a
+  similar or larger amount, twice, on separate days. Net worse.
+- **Fat LTO.** Worth 0.9 ms over thin, all of it on one workload, for roughly
+  6x the link time. Not worth imposing on everyone who builds from source.
+- **`Ident::to_string()` instead of `to_pretty_string()`, and skipping the
+  untyped-locals set for blocks with no statement-expression.** Both are
+  strictly less work, and neither was measurable: an interleaved A/B moved one
+  workload +5.1 ms and another -2.2 ms, which is code layout under LTO, not the
+  change.
+
+What remains is close to a floor that does not belong to cargo-mutants. Of the
+~122 ms the three fixtures now take, about 57 ms is three `cargo metadata`
+spawns (19 ms each; `cargo-mutants --list` on an empty crate costs 22.3 ms
+against cargo's own 19.0 ms) and about 10 ms is clap building its command tree
+(`cargo-mutants --version`, which does no work at all, costs 4.5 ms). Most of
+the rest is `syn` parsing and the AST teardown behind it.
+
+### Measurement discipline, again
+
+The many-small-files workload has a broad, right-skewed wall-time distribution
+— 37.7 to 46.2 ms for one fixed binary, median 42.9 — because it spawns a
+thread per file. A min-of-5 on that does not converge, and it produced two
+apparent results that were really draws from the same distribution. The
+benchmark now takes 21 repetitions and reports the median alongside the
+minimum, so that a build whose distribution has actually shifted can be told
+apart from one that drew a lucky minimum.
+
 
 ---
 
