@@ -56,6 +56,10 @@ pub struct Options {
     /// Copy the /target directory to build directories.
     pub copy_target: bool,
 
+    /// Detect mutants that build to exactly the same machine code as the
+    /// unmutated tree, or as another mutant, and don't test them.
+    pub detect_equivalent_mutants: bool,
+
     /// Don't copy at all; run tests in the source directory.
     pub in_place: bool,
 
@@ -118,6 +122,11 @@ pub struct Options {
     /// This matches as a string against the last component of the path, so should not include
     /// `::`.
     pub skip_calls: Vec<String>,
+
+    /// Don't build or test mutants in code that the test suite never executes.
+    ///
+    /// Their outcome is known in advance: no test can catch them.
+    pub skip_uncovered: bool,
 
     /// Cargo profile.
     pub profile: Option<String>,
@@ -343,6 +352,8 @@ impl Options {
             cap_lints: args.cap_lints.unwrap_or(config.cap_lints),
             check_only: args.check,
             colors: args.colors,
+            detect_equivalent_mutants: args.detect_equivalent_mutants
+                || config.detect_equivalent_mutants.unwrap_or(false),
             copy_vcs: args.copy_vcs.or(config.copy_vcs).unwrap_or(false),
             emit_json: args.json,
             common: args.common.merge(&config.common),
@@ -381,6 +392,7 @@ impl Options {
             show_times: !args.no_times,
             show_all_logs: args.all_logs,
             skip_calls,
+            skip_uncovered: args.skip_uncovered || config.skip_uncovered.unwrap_or(false),
             test_package,
             test_timeout: args.timeout.map(Duration::from_secs_f64),
             test_timeout_multiplier: args.timeout_multiplier.or(config.timeout_multiplier),
@@ -477,10 +489,12 @@ impl Options {
 
     /// True if the options allow this mutant to be tested.
     pub fn allows_mutant(&self, mutant: &Mutant) -> bool {
-        // `Mutant::name` is precomputed at construction as `name(true)`, so
-        // rebuilding it here would repeat that work for every mutant, even
-        // when neither filter is configured.
-        let name = &mutant.name;
+        if self.examine_name_re.is_empty() && self.exclude_name_re.is_empty() {
+            // Don't build the mutant's name, which is otherwise only needed
+            // for output, just to match it against nothing.
+            return true;
+        }
+        let name = mutant.full_name();
         (self.examine_name_re.is_empty() || self.examine_name_re.is_match(name))
             && (self.exclude_name_re.is_empty() || !self.exclude_name_re.is_match(name))
     }

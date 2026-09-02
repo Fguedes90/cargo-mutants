@@ -4,6 +4,7 @@
 
 #![warn(clippy::pedantic)]
 
+use std::collections::HashMap;
 use std::iter;
 
 use itertools::Itertools;
@@ -21,16 +22,72 @@ use crate::pretty::ToPrettyString;
 pub(crate) fn return_type_replacements(
     return_type: &ReturnType,
     error_exprs: &[Expr],
+    enums: &EnumIndex,
 ) -> Vec<TokenStream> {
     match return_type {
         ReturnType::Default => vec![quote! { () }],
-        ReturnType::Type(_rarrow, type_) => type_replacements(type_, error_exprs).collect_vec(),
+        ReturnType::Type(_rarrow, type_) => {
+            type_replacements(type_, error_exprs, enums).collect_vec()
+        }
+    }
+}
+
+/// Unit variants of the enums declared in the file being visited, by enum name.
+///
+/// Only same-file enums: resolving a type to a declaration in another file or
+/// crate would need a workspace-wide type index, which this crate deliberately
+/// does not have.
+#[derive(Debug, Default)]
+pub(crate) struct EnumIndex(HashMap<String, Vec<Ident>>);
+
+impl EnumIndex {
+    /// Collect every enum declared in the file, including inside inline `mod` blocks.
+    pub(crate) fn from_file(file: &syn::File) -> EnumIndex {
+        let mut index = EnumIndex::default();
+        index.add_items(&file.items);
+        index
+    }
+
+    fn add_items(&mut self, items: &[syn::Item]) {
+        for item in items {
+            match item {
+                syn::Item::Enum(item_enum) => {
+                    let unit_variants = item_enum
+                        .variants
+                        .iter()
+                        .filter(|v| matches!(v.fields, syn::Fields::Unit))
+                        .map(|v| v.ident.clone())
+                        .collect_vec();
+                    if !unit_variants.is_empty() {
+                        self.0.insert(item_enum.ident.to_string(), unit_variants);
+                    }
+                }
+                syn::Item::Mod(item_mod) => {
+                    if let Some((_brace, items)) = &item_mod.content {
+                        self.add_items(items);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Unit variants of the enum this path names, if it names a same-file enum
+    /// that has any.
+    fn unit_variants<'s, 'p>(&'s self, path: &'p Path) -> Option<(&'p Ident, &'s [Ident])> {
+        let last = path.segments.last()?;
+        let variants = self.0.get(&last.ident.to_string())?;
+        Some((&last.ident, variants))
     }
 }
 
 /// Generate some values that we hope are reasonable replacements for a type.
 #[allow(clippy::too_many_lines)]
-fn type_replacements(type_: &Type, error_exprs: &[Expr]) -> impl Iterator<Item = TokenStream> {
+fn type_replacements(
+    type_: &Type,
+    error_exprs: &[Expr],
+    enums: &EnumIndex,
+) -> impl Iterator<Item = TokenStream> {
     // This could probably change to run from some configuration rather than
     // hardcoding various types, which would make it easier to support tree-specific
     // mutation values, and perhaps reduce duplication. However, it seems better
@@ -45,6 +102,19 @@ fn type_replacements(type_: &Type, error_exprs: &[Expr]) -> impl Iterator<Item =
                 vec![quote! { String::new() }, quote! { "xyzzy".into() }]
             } else if path.is_ident("str") {
                 vec![quote! { "" }, quote! { "xyzzy" }]
+            } else if path.is_ident("char") {
+                vec![quote! { '\0' }, quote! { 'x' }]
+            } else if let Some(ident) = path_ident_in(path, &["PathBuf", "Utf8PathBuf"]) {
+                // Use the matched ident, not a fixed `PathBuf`: camino's
+                // `Utf8PathBuf` mirrors the std API but is a different type.
+                vec![quote! { #ident::new() }, quote! { #ident::from("xyzzy") }]
+            } else if path_ends_with(path, "OsString") {
+                vec![
+                    quote! { OsString::new() },
+                    quote! { OsString::from("xyzzy") },
+                ]
+            } else if path_ends_with(path, "Duration") {
+                vec![quote! { Duration::ZERO }, quote! { Duration::from_secs(1) }]
             } else if path_is_unsigned(path) {
                 vec![quote! { 0 }, quote! { 1 }]
             } else if path_is_signed(path) {
@@ -74,28 +144,47 @@ fn type_replacements(type_: &Type, error_exprs: &[Expr]) -> impl Iterator<Item =
                 }
             } else if path_is_float(path) {
                 vec![quote! { 0.0 }, quote! { 1.0 }, quote! { -1.0 }]
+            } else if path_is_cmp_ordering(path) {
+                vec![
+                    quote! { Ordering::Less },
+                    quote! { Ordering::Equal },
+                    quote! { Ordering::Greater },
+                ]
             } else if path_ends_with(path, "Result") {
-                if let Some(ok_type) = match_first_type_arg(path, "Result") {
-                    type_replacements(ok_type, error_exprs)
-                        .map(|rep| {
-                            quote! { Ok(#rep) }
-                        })
+                let ok_reps = if let Some(ok_type) = match_first_type_arg(path, "Result") {
+                    type_replacements(ok_type, error_exprs, enums)
+                        .map(|rep| quote! { Ok(#rep) })
                         .collect_vec()
                 } else {
                     // A result with no type arguments, like `fmt::Result`; hopefully
                     // the Ok value can be constructed with Default.
                     vec![quote! { Ok(Default::default()) }]
-                }
-                .into_iter()
-                .chain(error_exprs.iter().map(|error_expr| {
-                    quote! { Err(#error_expr) }
-                }))
-                .collect_vec()
+                };
+                let configured_errs = error_exprs
+                    .iter()
+                    .map(|error_expr| quote! { Err(#error_expr) })
+                    .collect_vec();
+                // Only recurse into the error type when we know how to build a value
+                // for it without relying on `Default`, which errors rarely implement.
+                let recursed_errs = match_nth_type_arg(path, "Result", 1)
+                    .filter(|err_type| is_simply_constructible(err_type))
+                    .map(|err_type| {
+                        type_replacements(err_type, error_exprs, enums)
+                            .map(|rep| quote! { Err(#rep) })
+                            .collect_vec()
+                    })
+                    .unwrap_or_default();
+                ok_reps
+                    .into_iter()
+                    .chain(configured_errs)
+                    .chain(recursed_errs)
+                    .unique_by(ToPrettyString::to_pretty_string)
+                    .collect_vec()
             } else if path_ends_with(path, "HttpResponse") {
                 vec![quote! { HttpResponse::Ok().finish() }]
             } else if let Some(some_type) = match_first_type_arg(path, "Option") {
                 iter::once(quote! { None })
-                    .chain(type_replacements(some_type, error_exprs).map(|rep| {
+                    .chain(type_replacements(some_type, error_exprs, enums).map(|rep| {
                         quote! { Some(#rep) }
                     }))
                     .collect_vec()
@@ -103,15 +192,17 @@ fn type_replacements(type_: &Type, error_exprs: &[Expr]) -> impl Iterator<Item =
                 // Generate an empty Vec, and then a one-element vec for every recursive
                 // value.
                 iter::once(quote! { vec![] })
-                    .chain(type_replacements(element_type, error_exprs).map(|rep| {
-                        quote! { vec![#rep] }
-                    }))
+                    .chain(
+                        type_replacements(element_type, error_exprs, enums).map(|rep| {
+                            quote! { vec![#rep] }
+                        }),
+                    )
                     .collect_vec()
             } else if let Some(borrowed_type) = match_first_type_arg(path, "Cow") {
                 // TODO: We could specialize Cows for cases like Vec and Box where
                 // we would have to leak to make the reference; perhaps it would only
                 // look better...
-                type_replacements(borrowed_type, error_exprs)
+                type_replacements(borrowed_type, error_exprs, enums)
                     .flat_map(|rep| {
                         [
                             quote! { Cow::Borrowed(#rep) },
@@ -119,26 +210,41 @@ fn type_replacements(type_: &Type, error_exprs: &[Expr]) -> impl Iterator<Item =
                         ]
                     })
                     .collect_vec()
+            } else if path_ident_in(path, &["Pin", "NonNull"]).is_some() {
+                // Every candidate generated for these fails to compile
+                // (E0061/E0599/E0308/E0277), so generating them only burns a build.
+                vec![]
+            } else if path_ident_in(path, &["Instant", "SystemTime"]).is_some() {
+                // No public constructor that takes a value, and no `Default`.
+                vec![]
+            } else if path_ident_in(path, &["Range"]).is_some() {
+                // `Range<T>` has a `Default` impl, but has one type argument and so
+                // would otherwise be caught by `maybe_collection_or_container` below
+                // and turned into `Range::new()` / `Range::from_iter(..)`, none of
+                // which compile.
+                vec![quote! { Default::default() }]
             } else if let Some((container_type, inner_type)) = known_container(path) {
                 // Something like Arc, Mutex, etc.
                 // TODO: Ideally we should use the path without relying on it being
                 // imported, but we must strip or rewrite the arguments, so that
                 // `std::sync::Arc<String>` becomes either `std::sync::Arc::<String>::new`
                 // or at least `std::sync::Arc::new`. Similarly for other types.
-                type_replacements(inner_type, error_exprs)
+                type_replacements(inner_type, error_exprs, enums)
                     .map(|rep| {
                         quote! { #container_type::new(#rep) }
                     })
                     .collect_vec()
             } else if let Some((collection_type, inner_type)) = known_collection(path) {
                 iter::once(quote! { #collection_type::new() })
-                    .chain(type_replacements(inner_type, error_exprs).map(|rep| {
-                        quote! { #collection_type::from_iter([#rep]) }
-                    }))
+                    .chain(
+                        type_replacements(inner_type, error_exprs, enums).map(|rep| {
+                            quote! { #collection_type::from_iter([#rep]) }
+                        }),
+                    )
                     .collect_vec()
             } else if let Some((collection_type, key_type, value_type)) = known_map(path) {
-                let key_reps = type_replacements(key_type, error_exprs).collect_vec();
-                let val_reps = type_replacements(value_type, error_exprs).collect_vec();
+                let key_reps = type_replacements(key_type, error_exprs, enums).collect_vec();
+                let val_reps = type_replacements(value_type, error_exprs, enums).collect_vec();
                 iter::once(quote! { #collection_type::new() })
                     .chain(
                         key_reps
@@ -153,13 +259,24 @@ fn type_replacements(type_: &Type, error_exprs: &[Expr]) -> impl Iterator<Item =
                 // to call it, but we strongly suspect that you could construct it from
                 // an `A`.
                 iter::once(quote! { #collection_type::new() })
-                    .chain(type_replacements(inner_type, error_exprs).flat_map(|rep| {
-                        [
-                            quote! { #collection_type::from_iter([#rep]) },
-                            quote! { #collection_type::new(#rep) },
-                            quote! { #collection_type::from(#rep) },
-                        ]
-                    }))
+                    .chain(
+                        type_replacements(inner_type, error_exprs, enums).flat_map(|rep| {
+                            [
+                                quote! { #collection_type::from_iter([#rep]) },
+                                quote! { #collection_type::new(#rep) },
+                                quote! { #collection_type::from(#rep) },
+                            ]
+                        }),
+                    )
+                    .collect_vec()
+            } else if let Some((enum_ident, variants)) = enums.unit_variants(path) {
+                // A same-file enum: its unit variants are values we know exist.
+                // `Default::default()` is not also emitted: for an enum deriving
+                // `Default` it would duplicate one of these, and otherwise it
+                // would be unviable.
+                variants
+                    .iter()
+                    .map(|variant| quote! { #enum_ident::#variant })
                     .collect_vec()
             } else {
                 trace!(
@@ -175,12 +292,15 @@ fn type_replacements(type_: &Type, error_exprs: &[Expr]) -> impl Iterator<Item =
         // large, and values like "all zeros" and "all ones" seem likely to catch
         // lots of things.
         {
-            type_replacements(elem, error_exprs)
+            type_replacements(elem, error_exprs, enums)
                 .map(|r| quote! { [ #r; #len ] })
                 .collect_vec()
         }
         Type::Slice(TypeSlice { elem, .. }) => iter::once(quote! { Vec::leak(Vec::new()) })
-            .chain(type_replacements(elem, error_exprs).map(|r| quote! { Vec::leak(vec![ #r ]) }))
+            .chain(
+                type_replacements(elem, error_exprs, enums)
+                    .map(|r| quote! { Vec::leak(vec![ #r ]) }),
+            )
             .collect_vec(),
         Type::Reference(syn::TypeReference {
             mutability: None,
@@ -196,10 +316,11 @@ fn type_replacements(type_: &Type, error_exprs: &[Expr]) -> impl Iterator<Item =
             }
             Type::Slice(TypeSlice { elem, .. }) => iter::once(quote! { Vec::leak(Vec::new()) })
                 .chain(
-                    type_replacements(elem, error_exprs).map(|r| quote! { Vec::leak(vec![ #r ]) }),
+                    type_replacements(elem, error_exprs, enums)
+                        .map(|r| quote! { Vec::leak(vec![ #r ]) }),
                 )
                 .collect_vec(),
-            _ => type_replacements(elem, error_exprs)
+            _ => type_replacements(elem, error_exprs, enums)
                 .map(|rep| {
                     quote! { Box::leak(Box::new(#rep)) }
                 })
@@ -212,12 +333,13 @@ fn type_replacements(type_: &Type, error_exprs: &[Expr]) -> impl Iterator<Item =
         }) => match &**elem {
             Type::Slice(TypeSlice { elem, .. }) => iter::once(quote! { Vec::leak(Vec::new()) })
                 .chain(
-                    type_replacements(elem, error_exprs).map(|r| quote! { Vec::leak(vec![ #r ]) }),
+                    type_replacements(elem, error_exprs, enums)
+                        .map(|r| quote! { Vec::leak(vec![ #r ]) }),
                 )
                 .collect_vec(),
             _ => {
                 // Make &mut with static lifetime by leaking them on the heap.
-                type_replacements(elem, error_exprs)
+                type_replacements(elem, error_exprs, enums)
                     .map(|rep| {
                         quote! { Box::leak(Box::new(#rep)) }
                     })
@@ -228,7 +350,7 @@ fn type_replacements(type_: &Type, error_exprs: &[Expr]) -> impl Iterator<Item =
             // Generate the cartesian product of replacements of every type within the tuple.
             elems
                 .iter()
-                .map(|elem| type_replacements(elem, error_exprs).collect_vec())
+                .map(|elem| type_replacements(elem, error_exprs, enums).collect_vec())
                 .multi_cartesian_product()
                 .map(|reps| {
                     quote! { ( #( #reps ),* ) }
@@ -240,7 +362,7 @@ fn type_replacements(type_: &Type, error_exprs: &[Expr]) -> impl Iterator<Item =
             if let Some(item_type) = match_impl_iterator(impl_trait) {
                 iter::once(quote! { ::std::iter::empty() })
                     .chain(
-                        type_replacements(item_type, error_exprs)
+                        type_replacements(item_type, error_exprs, enums)
                             .map(|r| quote! { ::std::iter::once(#r) }),
                     )
                     .collect_vec()
@@ -248,6 +370,12 @@ fn type_replacements(type_: &Type, error_exprs: &[Expr]) -> impl Iterator<Item =
                 // TODO: Can we do anything with other impl traits?
                 vec![]
             }
+        }
+        Type::TraitObject(_) => {
+            // `dyn Trait` can't be constructed by value; via `Box<dyn Trait>` this
+            // makes the whole function generate no FnValue mutants, which is correct:
+            // `Box::new(Default::default())` never compiles (E0790).
+            vec![]
         }
         Type::Never(_) => {
             vec![]
@@ -444,6 +572,58 @@ fn match_first_type_arg<'p>(path: &'p Path, expected_ident: &str) -> Option<&'p 
     None
 }
 
+/// True for `Ordering` and `cmp::Ordering`, but not `atomic::Ordering`.
+fn path_is_cmp_ordering(path: &Path) -> bool {
+    path_ends_with(path, "Ordering") && !path.segments.iter().any(|s| s.ident == "atomic")
+}
+
+/// If the last segment of the path is one of `names`, return its ident.
+fn path_ident_in<'p>(path: &'p Path, names: &[&str]) -> Option<&'p Ident> {
+    let last = path.segments.last()?;
+    names.iter().any(|n| last.ident == n).then_some(&last.ident)
+}
+
+/// If this is a path ending in `expected_ident`, return its `index`th type argument,
+/// ignoring lifetime arguments.
+fn match_nth_type_arg<'p>(path: &'p Path, expected_ident: &str, index: usize) -> Option<&'p Type> {
+    let last = path.segments.last()?;
+    if last.ident != expected_ident {
+        return None;
+    }
+    let PathArguments::AngleBracketed(AngleBracketedGenericArguments { args, .. }) =
+        &last.arguments
+    else {
+        return None;
+    };
+    args.iter()
+        .filter_map(|a| match a {
+            GenericArgument::Type(t) => Some(t),
+            _ => None,
+        })
+        .nth(index)
+}
+
+/// True for types whose replacement values are literals we know compile without
+/// relying on `Default`, used to decide whether recursing is worthwhile.
+fn is_simply_constructible(type_: &Type) -> bool {
+    match type_ {
+        Type::Path(syn::TypePath { path, .. }) => {
+            path.is_ident("bool")
+                || path.is_ident("String")
+                || path.is_ident("str")
+                || path.is_ident("char")
+                || path_is_unsigned(path)
+                || path_is_signed(path)
+                || path_is_float(path)
+        }
+        Type::Reference(syn::TypeReference { elem, .. }) => matches!(
+            &**elem,
+            Type::Path(syn::TypePath { path, .. }) if path.is_ident("str")
+        ),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod test {
     use itertools::Itertools;
@@ -453,7 +633,7 @@ mod test {
     use crate::fnvalue::match_impl_iterator;
     use crate::pretty::ToPrettyString;
 
-    use super::{known_map, return_type_replacements};
+    use super::{EnumIndex, known_map, return_type_replacements};
 
     #[test]
     fn recurse_into_result_bool() {
@@ -880,13 +1060,167 @@ mod test {
         );
     }
 
+    #[test]
+    fn cmp_ordering_replacements() {
+        check_replacements(
+            &parse_quote! { -> std::cmp::Ordering },
+            &[],
+            &["Ordering::Less", "Ordering::Equal", "Ordering::Greater"],
+        );
+    }
+
+    #[test]
+    fn range_replacement_is_default_not_a_guessed_constructor() {
+        check_replacements(
+            &parse_quote! { -> Range<i32> },
+            &[],
+            &["Default::default()"],
+        );
+    }
+
+    #[test]
+    fn unconstructible_types_generate_no_replacements() {
+        for return_type in [
+            parse_quote! { -> Box<dyn std::error::Error> },
+            parse_quote! { -> Pin<Box<String>> },
+            parse_quote! { -> NonNull<u8> },
+            parse_quote! { -> Instant },
+            parse_quote! { -> SystemTime },
+        ] {
+            check_replacements(&return_type, &[], &[]);
+        }
+    }
+
+    #[test]
+    fn recurse_into_result_error_type_when_simply_constructible() {
+        check_replacements(
+            &parse_quote! { -> Result<bool, String> },
+            &[],
+            &[
+                "Ok(true)",
+                "Ok(false)",
+                "Err(String::new())",
+                "Err(\"xyzzy\".into())",
+            ],
+        );
+    }
+
+    #[test]
+    fn dont_recurse_into_opaque_result_error_type() {
+        check_replacements(
+            &parse_quote! { -> Result<bool, anyhow::Error> },
+            &[],
+            &["Ok(true)", "Ok(false)"],
+        );
+    }
+
+    #[test]
+    fn char_replacements() {
+        check_replacements(&parse_quote! { -> char }, &[], &["'\\0'", "'x'"]);
+    }
+
+    #[test]
+    fn path_buf_replacements() {
+        check_replacements(
+            &parse_quote! { -> std::path::PathBuf },
+            &[],
+            &["PathBuf::new()", "PathBuf::from(\"xyzzy\")"],
+        );
+    }
+
+    #[test]
+    fn utf8_path_buf_replacements_use_the_matched_type() {
+        check_replacements(
+            &parse_quote! { -> camino::Utf8PathBuf },
+            &[],
+            &["Utf8PathBuf::new()", "Utf8PathBuf::from(\"xyzzy\")"],
+        );
+    }
+
+    #[test]
+    fn os_string_replacements() {
+        check_replacements(
+            &parse_quote! { -> std::ffi::OsString },
+            &[],
+            &["OsString::new()", "OsString::from(\"xyzzy\")"],
+        );
+    }
+
+    #[test]
+    fn duration_replacements() {
+        check_replacements(
+            &parse_quote! { -> std::time::Duration },
+            &[],
+            &["Duration::ZERO", "Duration::from_secs(1)"],
+        );
+    }
+
     fn check_replacements(return_type: &ReturnType, error_exprs: &[Expr], expected: &[&str]) {
+        check_replacements_with_enums(return_type, error_exprs, &EnumIndex::default(), expected);
+    }
+
+    fn check_replacements_with_enums(
+        return_type: &ReturnType,
+        error_exprs: &[Expr],
+        enums: &EnumIndex,
+        expected: &[&str],
+    ) {
         assert_eq!(
-            return_type_replacements(return_type, error_exprs)
+            return_type_replacements(return_type, error_exprs, enums)
                 .into_iter()
                 .map(|t| t.to_pretty_string())
                 .collect_vec(),
             expected
+        );
+    }
+
+    #[test]
+    fn same_file_enum_unit_variants_are_replacements() {
+        let file: syn::File = parse_quote! {
+            enum Colour {
+                Red,
+                Green,
+                Custom(u32),
+            }
+        };
+        check_replacements_with_enums(
+            &parse_quote! { -> Colour },
+            &[],
+            &EnumIndex::from_file(&file),
+            &["Colour::Red", "Colour::Green"],
+        );
+    }
+
+    #[test]
+    fn enum_in_inline_mod_is_indexed() {
+        let file: syn::File = parse_quote! {
+            mod inner {
+                enum Flag {
+                    On,
+                    Off,
+                }
+            }
+        };
+        check_replacements_with_enums(
+            &parse_quote! { -> inner::Flag },
+            &[],
+            &EnumIndex::from_file(&file),
+            &["Flag::On", "Flag::Off"],
+        );
+    }
+
+    #[test]
+    fn enum_without_unit_variants_falls_back_to_default() {
+        let file: syn::File = parse_quote! {
+            enum Wrapper {
+                A(u32),
+            }
+        };
+        check_replacements_with_enums(
+            &parse_quote! { -> Wrapper },
+            &[],
+            &EnumIndex::from_file(&file),
+            &["Default::default()"],
         );
     }
 

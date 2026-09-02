@@ -4,6 +4,11 @@ const fn should_stop_const() -> bool {
 
 /// If `should_stop_const` is mutated to return false, then this const block
 /// will hang and block compilation.
+///
+/// Mutants inside the initializer are skipped: replacing the `if` condition
+/// with `true` leaves `VAL` at 1, so no test can tell the difference, and this
+/// tree exists only to exercise the mutation of the const fn itself.
+#[mutants::skip]
 pub const VAL: i32 = loop {
     if should_stop_const() {
         break 1;

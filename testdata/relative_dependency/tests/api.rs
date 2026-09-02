@@ -14,3 +14,8 @@ fn double_factorial_one_is_2() {
 fn double_factorial_two_is_4() {
     assert_eq!(double_factorial(2), 4);
 }
+
+#[test]
+fn double_factorial_of_negative_is_0() {
+    assert_eq!(double_factorial(-1), 0);
+}

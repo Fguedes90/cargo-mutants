@@ -87,10 +87,7 @@ impl Workspace {
 
     /// Open the workspace containing a given directory.
     pub fn open<P: AsRef<Path>>(start_dir: P) -> Result<Self> {
-        let start_dir: &Utf8Path = start_dir
-            .as_ref()
-            .try_into()
-            .expect("start_dir is UTF-8");
+        let start_dir: &Utf8Path = start_dir.as_ref().try_into().expect("start_dir is UTF-8");
         ensure!(start_dir.is_dir(), "{start_dir:?} is not a directory");
         debug!(?start_dir, "Find workspace metadata");
         check_interrupted()?;

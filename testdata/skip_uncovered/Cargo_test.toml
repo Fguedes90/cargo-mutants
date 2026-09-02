@@ -1,0 +1,13 @@
+# A tree exercising `--skip-uncovered`: it contains a function that is
+# exercised by a real test (mutants must be built and caught), a function
+# that nothing in this crate ever calls (mutants must all be reported
+# `uncovered`), and a `const` initializer expression asserted on by a test
+# (mutants must still be caught, even though the initializer is evaluated at
+# compile time and so never trips a coverage counter).
+#
+# See README.md for details of each case.
+[package]
+name = "cargo-mutants-testdata-skip-uncovered"
+version = "0.1.0"
+edition = "2021"
+publish = false

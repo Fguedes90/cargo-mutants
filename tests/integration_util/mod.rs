@@ -26,7 +26,7 @@ pub fn run() -> assert_cmd::Command {
         .filter(|k| {
             k.starts_with("CARGO_MUTANTS_")
                 || k == "CLICOLOR_FORCE"
-                || k == "NOCOLOR"
+                || k == "NO_COLOR"
                 || k == "CARGO_TERM_COLOR"
                 || k == "GITHUB_ACTION"
         })
@@ -42,7 +42,11 @@ pub fn run() -> assert_cmd::Command {
 /// that need to spawn the binary directly via `std::process::Command`), so
 /// the function is gated on `cfg(unix)` to avoid a `dead_code` warning on
 /// other platforms.
+///
+/// This module is compiled into every integration test binary, and most of
+/// them don't need this, hence the `dead_code` allowance.
 #[cfg(unix)]
+#[allow(dead_code)]
 pub fn main_binary() -> &'static std::path::Path {
     assert_cmd::cargo_bin!("cargo-mutants")
 }

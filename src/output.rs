@@ -7,7 +7,7 @@ use std::fs::{File, OpenOptions, create_dir, read_to_string, remove_dir_all, ren
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use fs4::fs_std::FileExt;
@@ -23,9 +23,19 @@ const OUTDIR_NAME: &str = "mutants.out";
 const ROTATED_NAME: &str = "mutants.out.old";
 const LOCK_JSON: &str = "lock.json";
 const LOCK_POLL: Duration = Duration::from_millis(100);
+/// Minimum interval between rewrites of `outcomes.json` while the lab is running.
+///
+/// `outcomes.json` holds the whole accumulated `LabOutcome` and is rewritten from
+/// scratch on every scenario; without throttling, a run of N scenarios writes
+/// O(N^2) bytes. Throttling caps the rewrite rate while `finish()` still writes
+/// unconditionally, so an interrupted run leaves an outcomes.json that is at most
+/// this far behind.
+const OUTCOMES_WRITE_INTERVAL: Duration = Duration::from_millis(500);
 static CAUGHT_TXT: &str = "caught.txt";
 static PREVIOUSLY_CAUGHT_TXT: &str = "previously_caught.txt";
 static UNVIABLE_TXT: &str = "unviable.txt";
+static EQUIVALENT_TXT: &str = "equivalent.txt";
+static UNCOVERED_TXT: &str = "uncovered.txt";
 
 /// The contents of a `lock.json` written into the output directory and used as
 /// a lock file to ensure that two cargo-mutants invocations don't try to write
@@ -95,8 +105,16 @@ pub struct OutputDir {
     /// A file holding a list of mutants where testing timed out, as text, one per line.
     timeout_list: File,
     unviable_list: File,
+    /// A file holding a list of mutants skipped because their build artifacts
+    /// matched the baseline or an earlier mutant, as text, one per line.
+    equivalent_list: File,
+    /// A file holding a list of mutants skipped because coverage data showed
+    /// no test executes them, as text, one per line.
+    uncovered_list: File,
     /// The accumulated overall lab outcome.
     pub lab_outcome: LabOutcome,
+    /// When `outcomes.json` was last written, for throttling rewrites.
+    last_outcomes_write: Option<Instant>,
     /// Log filenames which have already been used, and the number of times that each
     /// basename has been used.
     used_log_names: HashMap<String, usize>,
@@ -156,14 +174,23 @@ impl OutputDir {
         let timeout_list = list_file_options
             .open(output_dir.join("timeout.txt"))
             .context("create timeout.txt")?;
+        let equivalent_list = list_file_options
+            .open(output_dir.join(EQUIVALENT_TXT))
+            .context("create equivalent.txt")?;
+        let uncovered_list = list_file_options
+            .open(output_dir.join(UNCOVERED_TXT))
+            .context("create uncovered.txt")?;
         Ok(OutputDir {
             path: output_dir,
             lab_outcome: LabOutcome::new(Timestamp::now()),
+            last_outcomes_write: None,
             lock_file,
             missed_list,
             caught_list,
             timeout_list,
             unviable_list,
+            equivalent_list,
+            uncovered_list,
             used_log_names: HashMap::new(),
         })
     }
@@ -206,9 +233,24 @@ impl OutputDir {
     }
 
     /// Add the result of testing one scenario.
+    ///
+    /// `outcomes.json` is rewritten from the full accumulated `lab_outcome` on
+    /// every call, but throttled to at most once per [`OUTCOMES_WRITE_INTERVAL`]
+    /// to bound total write volume on large runs. `finish` always writes
+    /// unconditionally, so the throttling can never drop the final state.
     pub fn add_scenario_outcome(&mut self, scenario_outcome: &ScenarioOutcome) -> Result<()> {
+        // `scenario_outcome` is also used by the caller after this call returns
+        // (e.g. to report to the console), so it can't be moved in and this
+        // clone is required.
         self.lab_outcome.add(scenario_outcome.to_owned());
-        self.write_lab_outcome()?;
+        let now = Instant::now();
+        if self
+            .last_outcomes_write
+            .is_none_or(|last| now.duration_since(last) >= OUTCOMES_WRITE_INTERVAL)
+        {
+            self.write_lab_outcome()?;
+            self.last_outcomes_write = Some(now);
+        }
         let scenario = &scenario_outcome.scenario;
         if let Scenario::Mutant(mutant) = scenario {
             let file = match scenario_outcome.summary() {
@@ -216,9 +258,11 @@ impl OutputDir {
                 SummaryOutcome::CaughtMutant => &mut self.caught_list,
                 SummaryOutcome::Timeout => &mut self.timeout_list,
                 SummaryOutcome::Unviable => &mut self.unviable_list,
+                SummaryOutcome::Equivalent => &mut self.equivalent_list,
+                SummaryOutcome::Uncovered => &mut self.uncovered_list,
                 _ => return Ok(()),
             };
-            writeln!(file, "{}", mutant.name(true)).context("write to list file")?;
+            writeln!(file, "{}", mutant.full_name()).context("write to list file")?;
         }
         Ok(())
     }
@@ -433,10 +477,12 @@ mod test {
                 "mutants.out",
                 "mutants.out/caught.txt",
                 "mutants.out/diff",
+                "mutants.out/equivalent.txt",
                 "mutants.out/lock.json",
                 "mutants.out/log",
                 "mutants.out/missed.txt",
                 "mutants.out/timeout.txt",
+                "mutants.out/uncovered.txt",
                 "mutants.out/unviable.txt",
                 "src",
                 "src/lib.rs",
@@ -539,5 +585,48 @@ src/process.rs:248:5: replace get_command_output -> Result<String> with Ok(Strin
         assert!(parent.join("mutants.out/previously_caught.txt").is_file());
         let now = load_previously_caught(parent).expect("load succeeds");
         assert_eq!(now.iter().collect_vec(), example.lines().collect_vec());
+    }
+
+    #[test]
+    fn finish_writes_every_outcome_even_when_earlier_writes_were_throttled() {
+        use crate::outcome::{Phase, PhaseResult};
+        use crate::process::Exit;
+
+        let tmp = minimal_source_tree();
+        let tmp_path: &Utf8Path = tmp.path().try_into().unwrap();
+        let workspace = Workspace::open(tmp_path).unwrap();
+        let mut output_dir = OutputDir::new(workspace.root()).unwrap();
+        let phase_result = || PhaseResult {
+            phase: Phase::Test,
+            duration: Duration::from_secs(1),
+            process_status: Exit::Success,
+            argv: vec!["cargo".into(), "test".into()],
+        };
+
+        // Add two outcomes back-to-back: the first write happens immediately
+        // (no prior write to throttle against), and the second is added so
+        // quickly afterwards that it's throttled and not written to disk yet.
+        let scenario_output_1 = output_dir.start_scenario(&Scenario::Baseline).unwrap();
+        let mut outcome_1 = ScenarioOutcome::new(&scenario_output_1, Scenario::Baseline);
+        outcome_1.add_phase_result(phase_result());
+        output_dir.add_scenario_outcome(&outcome_1).unwrap();
+
+        let scenario_output_2 = output_dir.start_scenario(&Scenario::Baseline).unwrap();
+        let mut outcome_2 = ScenarioOutcome::new(&scenario_output_2, Scenario::Baseline);
+        outcome_2.add_phase_result(phase_result());
+        output_dir.add_scenario_outcome(&outcome_2).unwrap();
+
+        let outcomes_json_path = output_dir.path().join("outcomes.json");
+        let lab_outcome = output_dir.finish().unwrap();
+        assert_eq!(lab_outcome.outcomes.len(), 2);
+        assert!(lab_outcome.end_time.is_some());
+
+        // `finish` writes unconditionally, so even a throttled last outcome
+        // must be present in the final file on disk, along with `end_time`.
+        let json: serde_json::Value =
+            serde_json::from_str(&read_to_string(&outcomes_json_path).unwrap()).unwrap();
+        let outcomes = json["outcomes"].as_array().unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(json["end_time"].is_string());
     }
 }

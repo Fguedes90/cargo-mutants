@@ -9,35 +9,40 @@
 #![allow(clippy::redundant_else)]
 
 use std::ffi::OsStr;
-use std::process::{Child, Command, Stdio};
-use std::thread::sleep;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use camino::Utf8Path;
 use serde::Serialize;
-use tracing::{Level, debug, span, trace};
+use tracing::{Level, debug, span};
 
 use crate::Result;
 use crate::console::Console;
 use crate::interrupt::check_interrupted;
 use crate::output::ScenarioOutput;
 
-/// How frequently to check if a subprocess finished.
+/// How frequently to check for a timeout or Ctrl-C interrupt, and to tick the
+/// progress bar, while a subprocess is running.
+///
+/// This is *not* the latency with which a normal child exit is noticed: the
+/// platform child handle wakes (on Unix, essentially immediately; see
+/// `process::unix`) as soon as the child exits, rather than waiting for the
+/// next poll.
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-use windows::{configure_command, terminate_child};
+use windows::{ChildHandle, configure_command, spawn as spawn_child};
 
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
-use unix::{configure_command, terminate_child};
+use unix::{ChildHandle, configure_command, spawn as spawn_child};
 
 pub struct Process {
-    child: Child,
+    child: ChildHandle,
     start: Instant,
     timeout: Option<Duration>,
 }
@@ -56,11 +61,10 @@ impl Process {
     ) -> Result<Exit> {
         let mut child = Process::start(argv, env, cwd, timeout, jobserver, scenario_output)?;
         let process_status = loop {
-            if let Some(exit_status) = child.poll()? {
+            if let Some(exit_status) = child.wait_step(WAIT_POLL_INTERVAL)? {
                 break exit_status;
             }
             console.tick();
-            sleep(WAIT_POLL_INTERVAL);
         };
         scenario_output.message(&format!("result: {process_status:?}"))?;
         Ok(process_status)
@@ -92,9 +96,8 @@ impl Process {
             js.configure(&mut command);
         }
         configure_command(&mut command);
-        let child = command
-            .spawn()
-            .with_context(|| format!("failed to spawn {}", argv.join(" ")))?;
+        let child =
+            spawn_child(command).with_context(|| format!("failed to spawn {}", argv.join(" ")))?;
         Ok(Process {
             child,
             start,
@@ -102,9 +105,15 @@ impl Process {
         })
     }
 
-    /// Check if the child process has finished; if so, return its status.
+    /// Check the timeout and Ctrl-C interrupt, and otherwise wait for the child to
+    /// exit, for up to `poll_interval`.
+    ///
+    /// Returns `Ok(None)` if `poll_interval` elapses with the child still running, so
+    /// that the caller can tick the progress bar and loop again. If the child exits
+    /// before `poll_interval` elapses this returns as soon as that's observed, rather
+    /// than waiting out the rest of the interval.
     #[mutants::skip] // It's hard to avoid timeouts if this never works...
-    pub fn poll(&mut self) -> Result<Option<Exit>> {
+    fn wait_step(&mut self, poll_interval: Duration) -> Result<Option<Exit>> {
         if self.timeout.is_some_and(|t| self.start.elapsed() > t) {
             debug!("timeout, terminating child process...",);
             self.terminate()?;
@@ -113,10 +122,8 @@ impl Process {
             debug!("interrupted, terminating child process...");
             self.terminate()?;
             Err(e)
-        } else if let Some(status) = self.child.try_wait()? {
-            Ok(Some(status.into()))
         } else {
-            Ok(None)
+            self.child.wait_for_exit(poll_interval)
         }
     }
 
@@ -129,13 +136,7 @@ impl Process {
     fn terminate(&mut self) -> Result<()> {
         let _span = span!(Level::DEBUG, "terminate_child", pid = self.child.id()).entered();
         debug!("terminating child process");
-        terminate_child(&mut self.child)?;
-        trace!("wait for child after termination");
-        match self.child.wait() {
-            Err(err) => debug!(?err, "Failed to wait for child after termination"),
-            Ok(exit) => debug!("terminated child exit status {exit:?}"),
-        }
-        Ok(())
+        self.child.terminate()
     }
 }
 
@@ -197,7 +198,16 @@ fn quote_argv<S: AsRef<str>, I: IntoIterator<Item = S>>(argv: I) -> String {
 
 #[cfg(test)]
 mod test {
-    use super::quote_argv;
+    use std::cmp::min;
+    use std::time::{Duration, Instant};
+
+    use camino::Utf8Path;
+    use tempfile::tempdir;
+
+    use super::{Exit, Process, quote_argv};
+    use crate::console::Console;
+    use crate::output::OutputDir;
+    use crate::scenario::Scenario;
 
     #[test]
     fn shell_quoting() {
@@ -210,6 +220,87 @@ mod test {
         assert_eq!(
             quote_argv(["with whitespace", "\r\n\t\t"]),
             r"with\ whitespace \r\n\t\t"
+        );
+    }
+
+    /// A near-instant subprocess exit is observed with much less latency than the
+    /// `WAIT_POLL_INTERVAL` poll interval, because the waiter thread wakes the main
+    /// loop as soon as the child exits rather than only on the next poll.
+    ///
+    /// The fastest of several runs is the one that matters: a single run also
+    /// measures whatever else the machine was doing, but polling would delay
+    /// *every* run to the next tick, so the minimum can only be small if the
+    /// exit is really observed as it happens.
+    #[cfg(unix)]
+    #[test]
+    fn a_near_instant_subprocess_is_observed_as_finished_well_under_the_old_poll_interval() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = Utf8Path::from_path(temp_dir.path()).unwrap();
+        let mut output_dir = OutputDir::new(cwd).unwrap();
+        let console = Console::new();
+
+        let mut fastest = Duration::MAX;
+        for _i in 0..5 {
+            let mut scenario_output = output_dir.start_scenario(&Scenario::Baseline).unwrap();
+            let start = Instant::now();
+            let exit = Process::run(
+                &["true".to_owned()],
+                &[],
+                cwd,
+                None,
+                None,
+                &mut scenario_output,
+                &console,
+            )
+            .unwrap();
+            let elapsed = start.elapsed();
+            assert!(exit.is_success());
+            fastest = min(fastest, elapsed);
+        }
+        assert!(
+            fastest < Duration::from_millis(20),
+            "expected a near-instant subprocess exit to be observed in well under \
+             the old 50ms poll interval, but the fastest of 5 runs took {fastest:?}",
+        );
+    }
+
+    /// A subprocess that runs past its timeout is killed and reported as `Exit::Timeout`,
+    /// long before it would otherwise have finished on its own.
+    #[test]
+    fn a_subprocess_exceeding_its_timeout_is_killed_and_reported_as_timeout() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = Utf8Path::from_path(temp_dir.path()).unwrap();
+        let mut output_dir = OutputDir::new(cwd).unwrap();
+        let mut scenario_output = output_dir.start_scenario(&Scenario::Baseline).unwrap();
+        let console = Console::new();
+        let argv: Vec<String> = if cfg!(unix) {
+            vec!["sleep".to_owned(), "5".to_owned()]
+        } else {
+            vec![
+                "cmd".to_owned(),
+                "/C".to_owned(),
+                "ping -n 6 127.0.0.1 >nul".to_owned(),
+            ]
+        };
+
+        let start = Instant::now();
+        let exit = Process::run(
+            &argv,
+            &[],
+            cwd,
+            Some(Duration::from_millis(200)),
+            None,
+            &mut scenario_output,
+            &console,
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(exit, Exit::Timeout);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "expected the timeout to fire well before the subprocess would finish on \
+             its own, but it took {elapsed:?}",
         );
     }
 }

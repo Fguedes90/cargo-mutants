@@ -1,8 +1,7 @@
 ---
 source: tests/util/mod.rs
-assertion_line: 33
 expression: "String::from_utf8_lossy(&output.stdout)"
-
+snapshot_kind: text
 ---
 [
   {
@@ -1798,6 +1797,70 @@ expression: "String::from_utf8_lossy(&output.stdout)"
     }
   },
   {
+    "diff": "--- src/result.rs\n+++ replace a < 0 with true in error_if_negative\n@@ -2,17 +2,17 @@\n // fn io_result() -> std::io::Result<\n \n /// Simple easily-recognizable Result.\n fn simple_result() -> Result<&'static str, ()> {\n     Ok(\"success\")\n }\n \n fn error_if_negative(a: i32) -> Result<(), ()> {\n-    if a < 0 {\n+    if true /* ~ changed by cargo-mutants ~ */ {\n         Err(())\n     } else {\n         Ok(())\n     }\n }\n \n fn result_with_no_apparent_type_args() -> std::fmt::Result {\n     Err(Default::default())\n",
+    "file": "src/result.rs",
+    "function": {
+      "function_name": "error_if_negative",
+      "return_type": "-> Result<(), ()>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 15
+        },
+        "start": {
+          "column": 1,
+          "line": 9
+        }
+      }
+    },
+    "genre": "IfCondition",
+    "name": "src/result.rs:10:8: replace a < 0 with true in error_if_negative",
+    "package": "cargo-mutants-testdata-well-tested",
+    "replacement": "true",
+    "span": {
+      "end": {
+        "column": 13,
+        "line": 10
+      },
+      "start": {
+        "column": 8,
+        "line": 10
+      }
+    }
+  },
+  {
+    "diff": "--- src/result.rs\n+++ replace a < 0 with false in error_if_negative\n@@ -2,17 +2,17 @@\n // fn io_result() -> std::io::Result<\n \n /// Simple easily-recognizable Result.\n fn simple_result() -> Result<&'static str, ()> {\n     Ok(\"success\")\n }\n \n fn error_if_negative(a: i32) -> Result<(), ()> {\n-    if a < 0 {\n+    if false /* ~ changed by cargo-mutants ~ */ {\n         Err(())\n     } else {\n         Ok(())\n     }\n }\n \n fn result_with_no_apparent_type_args() -> std::fmt::Result {\n     Err(Default::default())\n",
+    "file": "src/result.rs",
+    "function": {
+      "function_name": "error_if_negative",
+      "return_type": "-> Result<(), ()>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 15
+        },
+        "start": {
+          "column": 1,
+          "line": 9
+        }
+      }
+    },
+    "genre": "IfCondition",
+    "name": "src/result.rs:10:8: replace a < 0 with false in error_if_negative",
+    "package": "cargo-mutants-testdata-well-tested",
+    "replacement": "false",
+    "span": {
+      "end": {
+        "column": 13,
+        "line": 10
+      },
+      "start": {
+        "column": 8,
+        "line": 10
+      }
+    }
+  },
+  {
     "diff": "--- src/result.rs\n+++ replace < with == in error_if_negative\n@@ -2,17 +2,17 @@\n // fn io_result() -> std::io::Result<\n \n /// Simple easily-recognizable Result.\n fn simple_result() -> Result<&'static str, ()> {\n     Ok(\"success\")\n }\n \n fn error_if_negative(a: i32) -> Result<(), ()> {\n-    if a < 0 {\n+    if a == /* ~ changed by cargo-mutants ~ */ 0 {\n         Err(())\n     } else {\n         Ok(())\n     }\n }\n \n fn result_with_no_apparent_type_args() -> std::fmt::Result {\n     Err(Default::default())\n",
     "file": "src/result.rs",
     "function": {
@@ -2566,6 +2629,70 @@ expression: "String::from_utf8_lossy(&output.stdout)"
     }
   },
   {
+    "diff": "--- src/slices.rs\n+++ replace a.len() < 3 with true in pad\n@@ -1,13 +1,13 @@\n use std::borrow::Cow;\n \n fn pad<'a>(aa: &'a mut [Cow<'static, str>]) -> &'a [Cow<'static, str>] {\n     for a in aa.iter_mut() {\n-        if a.len() < 3 {\n+        if true /* ~ changed by cargo-mutants ~ */ {\n             a.to_mut().push_str(\"___\");\n         }\n     }\n     aa\n }\n \n fn return_mut_slice(a: &mut [usize]) -> &mut [usize] {\n     for x in a.iter_mut() {\n",
+    "file": "src/slices.rs",
+    "function": {
+      "function_name": "pad",
+      "return_type": "-> &'a[Cow<'static, str>]",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 10
+        },
+        "start": {
+          "column": 1,
+          "line": 3
+        }
+      }
+    },
+    "genre": "IfCondition",
+    "name": "src/slices.rs:5:12: replace a.len() < 3 with true in pad",
+    "package": "cargo-mutants-testdata-well-tested",
+    "replacement": "true",
+    "span": {
+      "end": {
+        "column": 23,
+        "line": 5
+      },
+      "start": {
+        "column": 12,
+        "line": 5
+      }
+    }
+  },
+  {
+    "diff": "--- src/slices.rs\n+++ replace a.len() < 3 with false in pad\n@@ -1,13 +1,13 @@\n use std::borrow::Cow;\n \n fn pad<'a>(aa: &'a mut [Cow<'static, str>]) -> &'a [Cow<'static, str>] {\n     for a in aa.iter_mut() {\n-        if a.len() < 3 {\n+        if false /* ~ changed by cargo-mutants ~ */ {\n             a.to_mut().push_str(\"___\");\n         }\n     }\n     aa\n }\n \n fn return_mut_slice(a: &mut [usize]) -> &mut [usize] {\n     for x in a.iter_mut() {\n",
+    "file": "src/slices.rs",
+    "function": {
+      "function_name": "pad",
+      "return_type": "-> &'a[Cow<'static, str>]",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 10
+        },
+        "start": {
+          "column": 1,
+          "line": 3
+        }
+      }
+    },
+    "genre": "IfCondition",
+    "name": "src/slices.rs:5:12: replace a.len() < 3 with false in pad",
+    "package": "cargo-mutants-testdata-well-tested",
+    "replacement": "false",
+    "span": {
+      "end": {
+        "column": 23,
+        "line": 5
+      },
+      "start": {
+        "column": 12,
+        "line": 5
+      }
+    }
+  },
+  {
     "diff": "--- src/slices.rs\n+++ replace < with == in pad\n@@ -1,13 +1,13 @@\n use std::borrow::Cow;\n \n fn pad<'a>(aa: &'a mut [Cow<'static, str>]) -> &'a [Cow<'static, str>] {\n     for a in aa.iter_mut() {\n-        if a.len() < 3 {\n+        if a.len() == /* ~ changed by cargo-mutants ~ */ 3 {\n             a.to_mut().push_str(\"___\");\n         }\n     }\n     aa\n }\n \n fn return_mut_slice(a: &mut [usize]) -> &mut [usize] {\n     for x in a.iter_mut() {\n",
     "file": "src/slices.rs",
     "function": {
@@ -2658,6 +2785,38 @@ expression: "String::from_utf8_lossy(&output.stdout)"
       "start": {
         "column": 20,
         "line": 5
+      }
+    }
+  },
+  {
+    "diff": "--- src/slices.rs\n+++ delete a.to_mut().push_str(\"___\"); in pad\n@@ -1,14 +1,14 @@\n use std::borrow::Cow;\n \n fn pad<'a>(aa: &'a mut [Cow<'static, str>]) -> &'a [Cow<'static, str>] {\n     for a in aa.iter_mut() {\n         if a.len() < 3 {\n-            a.to_mut().push_str(\"___\");\n+             /* ~ changed by cargo-mutants ~ */\n         }\n     }\n     aa\n }\n \n fn return_mut_slice(a: &mut [usize]) -> &mut [usize] {\n     for x in a.iter_mut() {\n         *x *= 2\n",
+    "file": "src/slices.rs",
+    "function": {
+      "function_name": "pad",
+      "return_type": "-> &'a[Cow<'static, str>]",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 10
+        },
+        "start": {
+          "column": 1,
+          "line": 3
+        }
+      }
+    },
+    "genre": "DeleteStatement",
+    "name": "src/slices.rs:6:13: delete a.to_mut().push_str(\"___\"); in pad",
+    "package": "cargo-mutants-testdata-well-tested",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 40,
+        "line": 6
+      },
+      "start": {
+        "column": 13,
+        "line": 6
       }
     }
   },

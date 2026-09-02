@@ -32,7 +32,7 @@ pub fn list_mutants(mutants: &[Mutant], options: &Options) -> String {
             }
             out.push('\n');
             if options.emit_diffs() {
-                out.push_str(&mutant.diff(&mutant.mutated_code()));
+                out.push_str(mutant.cached_diff());
                 out.push('\n');
             }
         }

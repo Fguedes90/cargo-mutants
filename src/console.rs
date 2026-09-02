@@ -81,6 +81,8 @@ impl Console {
                 SummaryOutcome::Timeout => model.timeouts += 1,
                 SummaryOutcome::Unviable => model.unviable += 1,
                 SummaryOutcome::Success => model.successes += 1,
+                SummaryOutcome::Equivalent => model.equivalent += 1,
+                SummaryOutcome::Uncovered => model.uncovered += 1,
                 SummaryOutcome::Failure => model.failures += 1,
             }
             model.remove_scenario(dir);
@@ -428,6 +430,8 @@ struct LabModel {
     timeouts: usize,
     successes: usize,
     failures: usize,
+    equivalent: usize,
+    uncovered: usize,
 }
 
 impl nutmeg::Model for LabModel {
@@ -484,6 +488,18 @@ impl nutmeg::Model for LabModel {
             }
             if self.unviable > 0 {
                 write!(s, ", {} unviable", style(self.unviable).cyan()).unwrap();
+            }
+            if self.equivalent > 0 {
+                write!(s, ", {} equivalent", style(self.equivalent).cyan()).unwrap();
+            }
+            if self.uncovered > 0 {
+                write!(
+                    s,
+                    ", {} {}",
+                    style(self.uncovered).cyan(),
+                    style("uncovered").red()
+                )
+                .unwrap();
             }
             // Maybe don't report these, because they're uninteresting?
             // if self.successes > 0 {
@@ -662,6 +678,8 @@ pub fn style_outcome(outcome: &ScenarioOutcome) -> StyledObject<&'static str> {
         SummaryOutcome::Success => style("ok").green(),
         SummaryOutcome::Unviable => style("unviable").blue(),
         SummaryOutcome::Timeout => style("TIMEOUT").red().bold(),
+        SummaryOutcome::Equivalent => style("equivalent").cyan(),
+        SummaryOutcome::Uncovered => style("UNCOVERED").red().bold(),
     }
 }
 

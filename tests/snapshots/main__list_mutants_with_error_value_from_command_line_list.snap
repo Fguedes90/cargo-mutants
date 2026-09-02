@@ -6,4 +6,9 @@ snapshot_kind: text
 src/lib.rs:4:5: replace zero_is_ok -> Result<u32, &'static str> with Ok(0)
 src/lib.rs:4:5: replace zero_is_ok -> Result<u32, &'static str> with Ok(1)
 src/lib.rs:4:5: replace zero_is_ok -> Result<u32, &'static str> with Err(::eyre::eyre!("mutant"))
+src/lib.rs:4:5: replace zero_is_ok -> Result<u32, &'static str> with Err("")
+src/lib.rs:4:5: replace zero_is_ok -> Result<u32, &'static str> with Err("xyzzy")
+src/lib.rs:4:8: replace n == 0 with true in zero_is_ok
+src/lib.rs:4:8: replace n == 0 with false in zero_is_ok
 src/lib.rs:4:10: replace == with != in zero_is_ok
+

@@ -66,6 +66,16 @@ pub struct LabOutcome {
     pub timeout: usize,
     pub unviable: usize,
     pub success: usize,
+    /// Mutants whose build artifacts matched the baseline or an earlier
+    /// mutant, and so were never tested. These are excluded from `missed`
+    /// and `caught`: they were not "found" by any test, but they also
+    /// cannot be "missed" by one, since no test could possibly catch them.
+    pub equivalent: usize,
+    /// Mutants in code that the test suite never executes, and so were never
+    /// tested. Unlike `equivalent`, this *is* a real gap (a test could in
+    /// principle be written to cover the code), so it counts the same as
+    /// `missed` for [`Self::exit_code`].
+    pub uncovered: usize,
     pub start_time: Timestamp,
     pub end_time: Option<Timestamp>,
     pub cargo_mutants_version: String,
@@ -81,6 +91,8 @@ impl LabOutcome {
             timeout: 0,
             unviable: 0,
             success: 0,
+            equivalent: 0,
+            uncovered: 0,
             start_time,
             end_time: None,
             cargo_mutants_version: crate::VERSION.to_string(),
@@ -97,6 +109,8 @@ impl LabOutcome {
                 SummaryOutcome::Timeout => self.timeout += 1,
                 SummaryOutcome::Unviable => self.unviable += 1,
                 SummaryOutcome::Success => self.success += 1,
+                SummaryOutcome::Equivalent => self.equivalent += 1,
+                SummaryOutcome::Uncovered => self.uncovered += 1,
                 SummaryOutcome::Failure => {
                     // We don't expect to see failures that don't fit into the other categories.
                     warn!("Unclassified failure for mutant {:?}", outcome.scenario);
@@ -117,7 +131,7 @@ impl LabOutcome {
             ExitCode::BaselineFailed
         } else if self.timeout > 0 {
             ExitCode::Timeout
-        } else if self.missed > 0 {
+        } else if self.missed > 0 || self.uncovered > 0 {
             ExitCode::FoundProblems
         } else {
             ExitCode::Success
@@ -148,6 +162,12 @@ impl LabOutcome {
         if self.success != 0 {
             by_outcome.push(format!("{} succeeded", self.success));
         }
+        if self.equivalent != 0 {
+            by_outcome.push(format!("{} equivalent", self.equivalent));
+        }
+        if self.uncovered != 0 {
+            by_outcome.push(format!("{} uncovered", self.uncovered));
+        }
         s.push(by_outcome.join(", "));
         s.join("")
     }
@@ -168,6 +188,21 @@ pub struct ScenarioOutcome {
     pub scenario: Scenario,
     /// For each phase, the duration and the cargo result.
     phase_results: Vec<PhaseResult>,
+    /// If set, the test phase was deliberately never run for this reason
+    /// (rather than not having run yet, or having failed).
+    skip_reason: Option<SkipReason>,
+}
+
+/// Why a mutant's test phase was skipped without ever running it.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Hash)]
+pub enum SkipReason {
+    /// The mutant's build artifacts are byte-identical to the baseline, or to
+    /// an earlier mutant, so no test run could possibly distinguish it. See
+    /// `crate::artifacts`.
+    Equivalent,
+    /// The mutant is in code that the test suite never executes, determined
+    /// from coverage data. See `crate::coverage`.
+    Uncovered,
 }
 
 impl Serialize for ScenarioOutcome {
@@ -176,12 +211,13 @@ impl Serialize for ScenarioOutcome {
         S: Serializer,
     {
         // custom serialize to omit inessential info and to inline a summary.
-        let mut ss = serializer.serialize_struct("Outcome", 5)?;
+        let mut ss = serializer.serialize_struct("Outcome", 6)?;
         ss.serialize_field("scenario", &self.scenario)?;
         ss.serialize_field("summary", &self.summary())?;
         ss.serialize_field("log_path", &self.log_path)?;
         ss.serialize_field("diff_path", &self.diff_path)?;
         ss.serialize_field("phase_results", &self.phase_results)?;
+        ss.serialize_field("skip_reason", &self.skip_reason)?;
         ss.end()
     }
 }
@@ -194,7 +230,13 @@ impl ScenarioOutcome {
             diff_path: scenario_output.diff_path.clone(),
             scenario,
             phase_results: Vec::new(),
+            skip_reason: None,
         }
+    }
+
+    /// Mark the test phase as deliberately skipped, without ever running it.
+    pub fn set_skip_reason(&mut self, skip_reason: SkipReason) {
+        self.skip_reason = Some(skip_reason);
     }
 
     pub fn add_phase_result(&mut self, phase_result: PhaseResult) {
@@ -205,12 +247,16 @@ impl ScenarioOutcome {
         read_to_string(self.output_dir.join(&self.log_path)).context("read log file")
     }
 
-    pub fn last_phase(&self) -> Phase {
-        self.phase_results.last().unwrap().phase
+    /// The last phase that was run, or `None` if the scenario was skipped
+    /// before running any.
+    pub fn last_phase(&self) -> Option<Phase> {
+        self.phase_results.last().map(|pr| pr.phase)
     }
 
-    pub fn last_phase_result(&self) -> Exit {
-        self.phase_results.last().unwrap().process_status
+    /// How the last phase that was run ended, or `None` if the scenario was
+    /// skipped before running any.
+    pub fn last_phase_result(&self) -> Option<Exit> {
+        self.phase_results.last().map(|pr| pr.process_status)
     }
 
     /// Return the results of all phases.
@@ -229,8 +275,12 @@ impl ScenarioOutcome {
         !self.scenario.is_mutant() && !self.success()
     }
 
+    /// True if every phase that ran succeeded.
+    ///
+    /// A scenario that was skipped before running anything did not succeed:
+    /// nothing was proved about it.
     pub fn success(&self) -> bool {
-        self.last_phase_result().is_success()
+        self.last_phase_result().is_some_and(Exit::is_success)
     }
 
     pub fn has_timeout(&self) -> bool {
@@ -248,20 +298,25 @@ impl ScenarioOutcome {
     /// True if this outcome is a caught mutant: it's a mutant and the tests failed.
     pub fn mutant_caught(&self) -> bool {
         self.scenario.is_mutant()
-            && self.last_phase() == Phase::Test
-            && self.last_phase_result().is_failure()
+            && self.last_phase() == Some(Phase::Test)
+            && self.last_phase_result().is_some_and(Exit::is_failure)
     }
 
     /// True if this outcome is a missed mutant: it's a mutant and the tests succeeded.
     pub fn mutant_missed(&self) -> bool {
         self.scenario.is_mutant()
-            && self.last_phase() == Phase::Test
-            && self.last_phase_result().is_success()
+            && self.last_phase() == Some(Phase::Test)
+            && self.last_phase_result().is_some_and(Exit::is_success)
     }
 
     pub fn summary(&self) -> SummaryOutcome {
         // Caution: this function is called when rendering progress
         // and so should not log; see https://github.com/sourcefrog/nutmeg/issues/16.
+        match self.skip_reason {
+            Some(SkipReason::Equivalent) => return SummaryOutcome::Equivalent,
+            Some(SkipReason::Uncovered) => return SummaryOutcome::Uncovered,
+            None => {}
+        }
         match self.scenario {
             Scenario::Baseline => {
                 if self.has_timeout() {
@@ -335,6 +390,12 @@ pub enum SummaryOutcome {
     Unviable,
     Failure,
     Timeout,
+    /// The mutant's build artifacts were byte-identical to the baseline or
+    /// an earlier mutant, so the test phase was skipped.
+    Equivalent,
+    /// The mutant is in code the test suite never executes, so the test
+    /// phase was skipped. Unlike `Equivalent`, this is a real gap.
+    Uncovered,
 }
 
 #[cfg(test)]
@@ -366,6 +427,7 @@ mod test {
                     argv: vec!["cargo".into(), "test".into()],
                 },
             ],
+            skip_reason: None,
         };
         assert_eq!(
             outcome.phase_result(Phase::Build),

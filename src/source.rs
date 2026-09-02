@@ -87,11 +87,13 @@ impl SourceFile {
             return Ok(None);
         }
         let full_path = tree_path.join(tree_relative_path);
-        let code = Arc::new(
-            read_to_string(&full_path)
-                .with_context(|| format!("failed to read source of {full_path:?}"))?
-                .replace("\r\n", "\n"),
-        );
+        let text = read_to_string(&full_path)
+            .with_context(|| format!("failed to read source of {full_path:?}"))?;
+        let code = Arc::new(if text.contains('\r') {
+            text.replace("\r\n", "\n")
+        } else {
+            text
+        });
         let line_index = Arc::new(LineIndex::new(&code));
         Ok(Some(SourceFile {
             slash_path: tree_relative_path.to_slash_path(),

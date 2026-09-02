@@ -30,6 +30,10 @@ const NEXTEST_ALLOWED_CODES: &[i32] = &[
 ];
 
 /// Run cargo build, check, or test.
+///
+/// `extra_env` is appended to the child's environment after every other
+/// variable this function sets, so a later duplicate key (e.g. a caller
+/// overriding `CARGO_ENCODED_RUSTFLAGS`) wins.
 #[allow(clippy::too_many_arguments)] // I agree it's a lot but I'm not sure wrapping in a struct would be better.
 pub fn run_cargo(
     build_dir: &BuildDir,
@@ -39,6 +43,7 @@ pub fn run_cargo(
     timeout: Option<Duration>,
     scenario_output: &mut ScenarioOutput,
     options: &Options,
+    extra_env: &[(&str, &str)],
     console: &Console,
 ) -> Result<PhaseResult> {
     let _span = debug_span!("run", ?phase).entered();
@@ -55,6 +60,11 @@ pub fn run_cargo(
         debug!(?encoded_rustflags);
         env.push(("CARGO_ENCODED_RUSTFLAGS".to_owned(), encoded_rustflags));
     }
+    env.extend(
+        extra_env
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+    );
     let process_status = Process::run(
         &argv,
         &env,
@@ -93,11 +103,45 @@ pub fn cargo_bin() -> String {
 /// Make up the argv for a cargo check/build/test invocation, including argv[0] as the
 /// cargo binary itself.
 // (This is split out so it's easier to test.)
-fn cargo_argv(packages: &PackageSelection, phase: Phase, options: &Options) -> Vec<String> {
+pub(crate) fn cargo_argv(
+    packages: &PackageSelection,
+    phase: Phase,
+    options: &Options,
+) -> Vec<String> {
     let mut cargo_args = vec![cargo_bin()];
     match phase {
         Phase::Test => match &options.test_tool() {
-            TestTool::Cargo => cargo_args.push("test".to_string()),
+            TestTool::Cargo => {
+                cargo_args.push("test".to_string());
+                if options.detect_equivalent_mutants || options.skip_uncovered {
+                    // Both `--detect-equivalent-mutants` and
+                    // `--skip-uncovered` infer a mutant's outcome from a
+                    // signal that doc tests never contribute to:
+                    // equivalent-mutant detection compares the compiled
+                    // test executables byte for byte (see `artifacts.rs`),
+                    // which only covers the binaries built by `cargo test
+                    // --no-run`; `--skip-uncovered` reads coverage counters
+                    // from `-Cinstrument-coverage` via RUSTFLAGS, which
+                    // rustdoc doesn't honour. Either way, a function
+                    // exercised only by a doc test looks exactly like dead
+                    // code to the signal being used, so a mutant there
+                    // could be wrongly judged equivalent/uncovered even
+                    // though a doc test would actually have caught it. Fix
+                    // that by restricting the run to the same targets the
+                    // signal actually covers, so the signal is a sound
+                    // proxy for everything this run can catch.
+                    // `--lib --bins --tests` is the narrowest selection
+                    // that still runs everything a plain `cargo test`
+                    // would (lib tests, binary tests, and integration
+                    // tests), while excluding doc tests; `--all-targets`
+                    // also excludes doc tests but additionally pulls in
+                    // benches and examples that a plain `cargo test`
+                    // wouldn't run, so it's not the narrowest choice.
+                    cargo_args.push("--lib".to_string());
+                    cargo_args.push("--bins".to_string());
+                    cargo_args.push("--tests".to_string());
+                }
+            }
             TestTool::Nextest => {
                 cargo_args.push("nextest".to_string());
                 cargo_args.push("run".to_string());
@@ -172,32 +216,49 @@ fn cargo_argv(packages: &PackageSelection, phase: Phase, options: &Options) -> V
 ///
 /// See <https://doc.rust-lang.org/cargo/reference/environment-variables.html>
 /// <https://doc.rust-lang.org/rustc/lints/levels.html#capping-lints>
-fn encoded_rustflags(options: &Options) -> Option<String> {
-    let cap_lints_arg = "--cap-lints=warn";
+pub(crate) fn encoded_rustflags(options: &Options) -> Option<String> {
     let separator = "\x1f";
-    if !options.cap_lints {
-        None
-    } else if let Ok(encoded) = env::var("CARGO_ENCODED_RUSTFLAGS") {
+    let mut extra_args: Vec<&str> = Vec::new();
+    if options.cap_lints {
+        extra_args.push("--cap-lints=warn");
+    }
+    if options.detect_equivalent_mutants {
+        // Equivalent-mutant detection (Trivial Compiler Equivalence) compares
+        // build artifacts byte for byte. Embedded debug info records source
+        // line numbers, which necessarily move when a mutation is applied
+        // even if the generated code is identical, so debug info must be
+        // turned off for the comparison to be meaningful. See `artifacts.rs`.
+        extra_args.push("-Cdebuginfo=0");
+    }
+    if extra_args.is_empty() {
+        return None;
+    }
+    if let Ok(encoded) = env::var("CARGO_ENCODED_RUSTFLAGS") {
         if encoded.is_empty() {
-            Some(cap_lints_arg.to_owned())
+            Some(extra_args.join(separator))
         } else {
-            Some(encoded + separator + cap_lints_arg)
+            Some(
+                once(encoded.as_str())
+                    .chain(extra_args)
+                    .collect::<Vec<&str>>()
+                    .join(separator),
+            )
         }
     } else if let Ok(rustflags) = env::var("RUSTFLAGS") {
         if rustflags.is_empty() {
-            Some(cap_lints_arg.to_owned())
+            Some(extra_args.join(separator))
         } else {
             Some(
                 rustflags
                     .split(' ')
                     .filter(|s| !s.is_empty())
-                    .chain(once("--cap-lints=warn"))
+                    .chain(extra_args)
                     .collect::<Vec<&str>>()
                     .join(separator),
             )
         }
     } else {
-        Some(cap_lints_arg.to_owned())
+        Some(extra_args.join(separator))
     }
 }
 
@@ -385,6 +446,68 @@ mod test {
         );
     }
 
+    #[test]
+    fn detect_equivalent_mutants_excludes_doc_tests_from_the_cargo_test_invocation() {
+        let args =
+            Args::try_parse_from(["mutants", "--detect-equivalent-mutants"].as_slice()).unwrap();
+        let options = Options::from_args(&args).unwrap();
+        assert_eq!(
+            cargo_argv(&PackageSelection::All, Phase::Test, &options)[1..],
+            [
+                "test",
+                "--lib",
+                "--bins",
+                "--tests",
+                "--verbose",
+                "--workspace"
+            ]
+        );
+    }
+
+    #[test]
+    fn skip_uncovered_excludes_doc_tests_from_the_cargo_test_invocation() {
+        let args = Args::try_parse_from(["mutants", "--skip-uncovered"].as_slice()).unwrap();
+        let options = Options::from_args(&args).unwrap();
+        assert_eq!(
+            cargo_argv(&PackageSelection::All, Phase::Test, &options)[1..],
+            [
+                "test",
+                "--lib",
+                "--bins",
+                "--tests",
+                "--verbose",
+                "--workspace"
+            ]
+        );
+    }
+
+    #[test]
+    fn without_detect_equivalent_mutants_or_skip_uncovered_doc_tests_are_not_excluded() {
+        let options = Options::default();
+        assert_eq!(
+            cargo_argv(&PackageSelection::All, Phase::Test, &options)[1..],
+            ["test", "--verbose", "--workspace"]
+        );
+    }
+
+    #[test]
+    fn detect_equivalent_mutants_does_not_change_the_nextest_invocation() {
+        let args = Args::try_parse_from(
+            [
+                "mutants",
+                "--test-tool=nextest",
+                "--detect-equivalent-mutants",
+            ]
+            .as_slice(),
+        )
+        .unwrap();
+        let options = Options::from_args(&args).unwrap();
+        assert_eq!(
+            cargo_argv(&PackageSelection::All, Phase::Test, &options)[1..],
+            ["nextest", "run", "--verbose", "--workspace"]
+        );
+    }
+
     rusty_fork_test! {
         #[test]
         fn rustflags_without_cap_lints_and_no_environment_variables() {
@@ -442,6 +565,46 @@ mod test {
                 cap_lints: true,
                 ..Default::default()
             }).unwrap(), "-Dwarnings\x1f--cap-lints=warn");
+        }
+
+        #[test]
+        fn detect_equivalent_mutants_adds_debuginfo_0_rustflag() {
+            single_threaded_remove_env_var("RUSTFLAGS");
+            single_threaded_remove_env_var("CARGO_ENCODED_RUSTFLAGS");
+            assert_eq!(
+                encoded_rustflags(&Options {
+                    detect_equivalent_mutants: true,
+                    ..Default::default()
+                }),
+                Some("-Cdebuginfo=0".into())
+            );
+        }
+
+        #[test]
+        fn debuginfo_flag_is_absent_when_detect_equivalent_mutants_is_off() {
+            single_threaded_remove_env_var("RUSTFLAGS");
+            single_threaded_remove_env_var("CARGO_ENCODED_RUSTFLAGS");
+            assert_eq!(
+                encoded_rustflags(&Options {
+                    detect_equivalent_mutants: false,
+                    ..Default::default()
+                }),
+                None
+            );
+        }
+
+        #[test]
+        fn detect_equivalent_mutants_and_cap_lints_are_both_present() {
+            single_threaded_remove_env_var("RUSTFLAGS");
+            single_threaded_remove_env_var("CARGO_ENCODED_RUSTFLAGS");
+            assert_eq!(
+                encoded_rustflags(&Options {
+                    cap_lints: true,
+                    detect_equivalent_mutants: true,
+                    ..Default::default()
+                }),
+                Some("--cap-lints=warn\x1f-Cdebuginfo=0".into())
+            );
         }
     }
 }

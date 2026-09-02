@@ -12,11 +12,13 @@
 )]
 
 mod annotation;
+mod artifacts;
 mod build_dir;
 mod cargo;
 mod config;
 mod console;
 mod copy_tree;
+mod coverage;
 mod exit_code;
 mod fnvalue;
 mod glob;
@@ -264,6 +266,15 @@ pub struct Args {
     #[arg(last = true, help_heading = "Execution")]
     cargo_test_args: Vec<String>,
 
+    /// Detect mutants that build to identical machine code, and don't test them.
+    ///
+    /// A mutant whose build output is byte-identical to the unmutated tree can't
+    /// be caught by any test; one identical to another mutant is redundant with
+    /// it. This turns off debug info, so that the comparison is not defeated by
+    /// line numbers moving.
+    #[arg(long, help_heading = "Execution")]
+    detect_equivalent_mutants: bool,
+
     /// Cargo check generated mutants, but don't run tests.
     #[arg(long, help_heading = "Execution")]
     check: bool,
@@ -398,6 +409,14 @@ pub struct Args {
     /// The default is `with_capacity`.
     #[arg(long, help_heading = "Filters")]
     skip_calls_defaults: Option<bool>,
+
+    /// Don't build or test mutants in code that the test suite never runs.
+    ///
+    /// The baseline tests are first run with coverage instrumentation, which
+    /// needs the `llvm-tools` rustup component. Uncovered mutants are reported
+    /// as missed without being built.
+    #[arg(long, help_heading = "Filters")]
+    skip_uncovered: bool,
 
     /// Generate mutations in every package in the workspace.
     #[arg(long, help_heading = "Filters")]

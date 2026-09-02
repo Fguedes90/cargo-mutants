@@ -10,9 +10,10 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::needless_raw_string_hashes)]
 
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::panic::resume_unwind;
-use std::sync::Arc;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::vec;
 
@@ -24,11 +25,13 @@ use regex::RegexSet;
 use syn::ext::IdentExt;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
-use syn::{Attribute, BinOp, Block, Expr, ExprPath, File, ItemFn, ReturnType, Signature, UnOp};
+use syn::{
+    Attribute, BinOp, Block, Expr, ExprPath, File, ItemFn, ReturnType, Signature, Stmt, UnOp,
+};
 use tracing::{debug_span, error, info, trace, trace_span, warn};
 
 use crate::console::WalkProgress;
-use crate::fnvalue::return_type_replacements;
+use crate::fnvalue::{EnumIndex, return_type_replacements};
 use crate::mutant::{Function, MutationTarget};
 use crate::package::Package;
 use crate::pretty::ToPrettyString;
@@ -48,9 +51,9 @@ pub struct Discovered {
 impl Discovered {
     pub(crate) fn remove_previously_caught(&mut self, previously_caught: &[String]) {
         self.mutants.retain(|m| {
-            let c = previously_caught.contains(&m.name);
+            let c = previously_caught.iter().any(|c| c == m.full_name());
             if c {
-                trace!(name = %m.name, "skip previously caught mutant");
+                trace!(name = m.full_name(), "skip previously caught mutant");
             }
             !c
         });
@@ -100,23 +103,16 @@ fn walk_package(
         .map(|p| (p.to_owned(), true))
         .collect();
     while !pending.is_empty() {
-        let mut level = Vec::with_capacity(pending.len());
-        for (path, package_top) in pending.drain(..) {
-            if let Some(source_file) =
-                SourceFile::load(workspace_dir, &path, package, package_top)?
-            {
-                level.push(source_file);
-            } else {
-                info!("Skipping source file outside of tree: {path:?}");
-            }
-        }
-        if level.is_empty() {
-            break;
-        }
-        progress.increment_files(level.len());
         check_interrupted()?;
-        let walked = walk_files(&level, options)?;
-        for (source_file, (mut file_mutants, external_mods)) in level.into_iter().zip(walked) {
+        let level = std::mem::take(&mut pending);
+        let walked = walk_files(workspace_dir, package, &level, options)?;
+        for outcome in walked {
+            let Some((source_file, mut file_mutants, external_mods)) = outcome else {
+                // Resolved outside the tree; `walk_files` already logged it,
+                // and it doesn't count towards either progress counter.
+                continue;
+            };
+            progress.increment_files(1);
             progress.increment_mutants(file_mutants.len());
             // TODO: It would be better not to spend time generating mutants from
             // files that are not going to be visited later. However, we probably do
@@ -144,7 +140,36 @@ fn walk_package(
     Ok((mutants, files))
 }
 
-/// Walk a set of files, each on its own thread, returning results in input order.
+/// What walking one file yields: `None` if the path resolved outside the
+/// tree, matching [`SourceFile::load`].
+type WalkedFile = Option<(SourceFile, Vec<Mutant>, Vec<ExternalModRef>)>;
+
+/// The per-file result of [`walk_files`], including a failure to load or
+/// parse the file.
+type FileOutcome = Result<WalkedFile>;
+
+/// Load and walk a single pending file.
+///
+/// Loading (including CRLF normalization and line-indexing) and parsing both
+/// happen here, on the file's own thread, so they overlap with every other
+/// file's IO and parsing within the same level.
+fn load_and_walk_file(
+    workspace_dir: &Utf8Path,
+    package: &Package,
+    path: &Utf8Path,
+    package_top: bool,
+    options: &Options,
+) -> FileOutcome {
+    let Some(source_file) = SourceFile::load(workspace_dir, path, package, package_top)? else {
+        info!("Skipping source file outside of tree: {path:?}");
+        return Ok(None);
+    };
+    let (mutants, external_mods) = walk_file(&source_file, options)?;
+    Ok(Some((source_file, mutants, external_mods)))
+}
+
+/// Walk a set of pending files, each loaded and parsed on its own thread,
+/// returning results in input order.
 ///
 /// Each file gets a fresh thread for two reasons. `proc_macro2`'s source map,
 /// which backs every span lookup, is a thread-local that gains an entry per file
@@ -152,28 +177,57 @@ fn walk_package(
 /// thread costs O(mutants x files); a thread per file keeps exactly one file in
 /// the map. Running those threads concurrently then also uses the cores that
 /// would otherwise sit idle throughout discovery.
+///
+/// At most `available_parallelism()` files are ever in flight: rather than
+/// joining a whole fixed-size chunk before starting the next one (which lets
+/// a single slow file stall every other core until the chunk completes), a
+/// replacement file is spawned the moment any in-flight file finishes,
+/// keeping the window full until the level runs out.
 fn walk_files(
-    source_files: &[SourceFile],
+    workspace_dir: &Utf8Path,
+    package: &Package,
+    pending: &[(Utf8PathBuf, bool)],
     options: &Options,
-) -> Result<Vec<(Vec<Mutant>, Vec<ExternalModRef>)>> {
+) -> Result<Vec<WalkedFile>> {
     let concurrency = thread::available_parallelism().map_or(1, NonZeroUsize::get);
-    let mut results = Vec::with_capacity(source_files.len());
-    for chunk in source_files.chunks(concurrency) {
-        let walked = thread::scope(|scope| {
-            let handles = chunk
-                .iter()
-                .map(|source_file| scope.spawn(move || walk_file(source_file, options)))
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().unwrap_or_else(|payload| resume_unwind(payload)))
-                .collect::<Vec<_>>()
-        });
-        for result in walked {
-            results.push(result?);
+    let n = pending.len();
+    let mut results: Vec<Option<FileOutcome>> = std::iter::repeat_with(|| None).take(n).collect();
+    let (tx, rx) = mpsc::channel::<(usize, thread::Result<FileOutcome>)>();
+    thread::scope(|scope| {
+        let spawn_at = |idx: usize| {
+            let (path, package_top) = &pending[idx];
+            let tx = tx.clone();
+            scope.spawn(move || {
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    load_and_walk_file(workspace_dir, package, path, *package_top, options)
+                }));
+                let _ = tx.send((idx, outcome));
+            });
+        };
+        let mut next = 0;
+        let mut in_flight = 0;
+        while in_flight < concurrency && next < n {
+            spawn_at(next);
+            next += 1;
+            in_flight += 1;
         }
-    }
-    Ok(results)
+        while in_flight > 0 {
+            let (idx, outcome) = rx
+                .recv()
+                .expect("a walk_files worker exited without reporting a result");
+            results[idx] = Some(outcome.unwrap_or_else(|payload| resume_unwind(payload)));
+            in_flight -= 1;
+            if next < n {
+                spawn_at(next);
+                next += 1;
+                in_flight += 1;
+            }
+        }
+    });
+    results
+        .into_iter()
+        .map(|r| r.expect("every pending index should have produced a result"))
+        .collect()
 }
 
 /// Find all possible mutants in a source file.
@@ -191,8 +245,10 @@ pub fn walk_file(
     let error_exprs = options.parsed_error_exprs()?;
     let syn_file = syn::parse_str::<syn::File>(source_file.code())
         .with_context(|| format!("failed to parse {}", source_file.tree_relative_slashes()))?;
+    let enums = EnumIndex::from_file(&syn_file);
     let mut visitor = DiscoveryVisitor {
         error_exprs: &error_exprs,
+        enums: &enums,
         error: None,
         exclude_re_stack: Vec::new(),
         external_mods: Vec::new(),
@@ -200,8 +256,13 @@ pub fn walk_file(
         mod_namespace_stack: Vec::new(),
         namespace_stack: Vec::new(),
         fn_stack: Vec::new(),
+        fn_context_stack: Vec::new(),
+        guard_spans: Vec::new(),
+        closure_depth: 0,
+        const_eval_depth: 0,
         source_file: source_file.clone(),
         options,
+        control_flow_memo: ControlFlowMemo::default(),
     };
     visitor.visit_file(&syn_file);
     if let Some(err) = visitor.error {
@@ -329,12 +390,35 @@ struct DiscoveryVisitor<'o> {
     /// there are nested functions.
     fn_stack: Vec<Arc<Function>>,
 
+    /// Per-function context for mutants that need to know something about the
+    /// enclosing function, innermost last.
+    fn_context_stack: Vec<FnContext>,
+
+    /// Spans of the match arm guards we're inside, so that a guard that is a
+    /// bool literal is not also mutated as a literal.
+    guard_spans: Vec<Span>,
+
+    /// How many closure or `async` bodies we're inside, whose return type is
+    /// usually inferred and so unknown here.
+    closure_depth: usize,
+
+    /// How many nested compile-time-evaluated constructs we're inside: a
+    /// `const`/`static` initializer, a `const fn` body, an array-length
+    /// expression, or a const generic argument. A depth counter (rather than
+    /// a boolean) so that leaving an inner one of these while still inside
+    /// an outer one doesn't lose the outer's flag.
+    const_eval_depth: usize,
+
     /// The names from `mod foo;` statements that should be visited later,
     /// namespaced relative to the source file
     external_mods: Vec<ExternalModRef>,
 
     /// Parsed error expressions, from the config file or command line.
     error_exprs: &'o [Expr],
+
+    /// Unit variants of the enums declared in this file, for mutating values of
+    /// those enum types.
+    enums: &'o EnumIndex,
 
     options: &'o Options,
 
@@ -349,6 +433,35 @@ struct DiscoveryVisitor<'o> {
     /// Since `Visit` trait methods cannot return errors, we store the error here
     /// and propagate it after the visitor finishes.
     error: Option<anyhow::Error>,
+
+    /// Cache of `return`/`break`/`continue` containment, shared across the
+    /// whole file so nested blocks reuse work already done by their
+    /// enclosing block. See [`ControlFlowMemo`].
+    control_flow_memo: ControlFlowMemo,
+}
+
+/// What the visitor needs to know about the function it's inside.
+struct FnContext {
+    /// Span of the function body excluding braces, if any.
+    body_span: Option<Span>,
+    /// Declared return type, for mutating `return` expressions.
+    output: ReturnType,
+    /// Whether the body is exactly one `return expr;` statement, in which case
+    /// a `ReturnValue` mutant would duplicate the `FnValue` mutant.
+    body_is_single_return: bool,
+}
+
+impl FnContext {
+    fn new(sig: &Signature, block: &Block) -> FnContext {
+        FnContext {
+            body_span: function_body_span(block),
+            output: sig.output.clone(),
+            body_is_single_return: matches!(
+                block.stmts.as_slice(),
+                [syn::Stmt::Expr(Expr::Return(_), _)]
+            ),
+        }
+    }
 }
 
 /// Whether entering a scope pushed an `exclude_re` entry that must be popped.
@@ -503,8 +616,9 @@ impl DiscoveryVisitor<'_> {
             replacement.to_pretty_string(),
             genre,
             None,
+            self.const_eval_depth > 0,
         );
-        if self.excluded_by_attr_re(&mutant.name) {
+        if self.excluded_by_attr_re(mutant.full_name()) {
             trace!(
                 name = mutant.name(false),
                 "skip mutant by exclude_re attribute"
@@ -519,7 +633,7 @@ impl DiscoveryVisitor<'_> {
     fn collect_fn_mutants(&mut self, sig: &Signature, block: &Block) {
         if let Some(function) = self.fn_stack.last().cloned() {
             let body_span = function_body_span(block).expect("Empty function body");
-            let repls = return_type_replacements(&sig.output, self.error_exprs);
+            let repls = return_type_replacements(&sig.output, self.error_exprs, self.enums);
             if repls.is_empty() {
                 trace!(
                     function_name = function.function_name,
@@ -551,6 +665,30 @@ impl DiscoveryVisitor<'_> {
         }
     }
 
+    /// Whether this expression is a call that `--skip-calls` asks us to leave alone.
+    ///
+    /// [`Self::visit_expr_call`] and [`Self::visit_expr_method_call`] stop
+    /// descending into such calls; a statement-level mutant is generated before
+    /// that descent, so it has to make the same check.
+    fn is_skipped_call(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Call(call) => match &*call.func {
+                Expr::Path(ExprPath { path, .. }) => self
+                    .options
+                    .skip_calls
+                    .iter()
+                    .any(|s| path_ends_with(path, s)),
+                _ => false,
+            },
+            Expr::MethodCall(method_call) => self
+                .options
+                .skip_calls
+                .iter()
+                .any(|s| method_call.method == s),
+            _ => false,
+        }
+    }
+
     /// Call a function with a namespace pushed onto the stack.
     ///
     /// This is used when recursively descending into a namespace.
@@ -561,6 +699,24 @@ impl DiscoveryVisitor<'_> {
         self.namespace_stack.push(name.to_owned());
         let r = f(self);
         assert_eq!(self.namespace_stack.pop().unwrap(), name);
+        r
+    }
+
+    /// Run `f` with the compile-time-evaluated depth counter incremented.
+    ///
+    /// Used for constructs the compiler evaluates at compile time: `const`
+    /// and `static` initializers, `const fn` bodies, array-length
+    /// expressions, and const generic arguments. Mutants discovered while
+    /// `f` runs are marked [`Mutant::const_eval`] so `--skip-uncovered`
+    /// knows a line with no coverage counter there is not necessarily
+    /// untestable.
+    fn in_const_eval_scope<F, T>(&mut self, f: F) -> T
+    where
+        F: FnOnce(&mut Self) -> T,
+    {
+        self.const_eval_depth += 1;
+        let r = f(self);
+        self.const_eval_depth -= 1;
         r
     }
 }
@@ -629,8 +785,18 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         }
         self.in_exclude_re_scope(&i.attrs, |v| {
             let function = v.enter_function(&i.sig.ident, &i.sig.output, i.span());
-            v.collect_fn_mutants(&i.sig, &i.block);
-            syn::visit::visit_item_fn(v, i);
+            let is_const_fn = i.sig.constness.is_some();
+            let visit_body = |v: &mut Self| {
+                v.collect_fn_mutants(&i.sig, &i.block);
+                v.fn_context_stack.push(FnContext::new(&i.sig, &i.block));
+                syn::visit::visit_item_fn(v, i);
+                v.fn_context_stack.pop();
+            };
+            if is_const_fn {
+                v.in_const_eval_scope(visit_body);
+            } else {
+                visit_body(v);
+            }
             v.leave_function(function);
         });
     }
@@ -655,8 +821,18 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         }
         self.in_exclude_re_scope(&i.attrs, |v| {
             let function = v.enter_function(&i.sig.ident, &i.sig.output, i.span());
-            v.collect_fn_mutants(&i.sig, &i.block);
-            syn::visit::visit_impl_item_fn(v, i);
+            let is_const_fn = i.sig.constness.is_some();
+            let visit_body = |v: &mut Self| {
+                v.collect_fn_mutants(&i.sig, &i.block);
+                v.fn_context_stack.push(FnContext::new(&i.sig, &i.block));
+                syn::visit::visit_impl_item_fn(v, i);
+                v.fn_context_stack.pop();
+            };
+            if is_const_fn {
+                v.in_const_eval_scope(visit_body);
+            } else {
+                visit_body(v);
+            }
             v.leave_function(function);
         });
     }
@@ -679,8 +855,18 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             }
             self.in_exclude_re_scope(&i.attrs, |v| {
                 let function = v.enter_function(&i.sig.ident, &i.sig.output, i.span());
-                v.collect_fn_mutants(&i.sig, block);
-                syn::visit::visit_trait_item_fn(v, i);
+                let is_const_fn = i.sig.constness.is_some();
+                let visit_body = |v: &mut Self| {
+                    v.collect_fn_mutants(&i.sig, block);
+                    v.fn_context_stack.push(FnContext::new(&i.sig, block));
+                    syn::visit::visit_trait_item_fn(v, i);
+                    v.fn_context_stack.pop();
+                };
+                if is_const_fn {
+                    v.in_const_eval_scope(visit_body);
+                } else {
+                    visit_body(v);
+                }
                 v.leave_function(function);
             });
         }
@@ -702,7 +888,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             trace!("const excluded by attrs");
             return;
         }
-        syn::visit::visit_item_const(self, i);
+        self.in_const_eval_scope(|v| syn::visit::visit_item_const(v, i));
     }
 
     /// Visit a top-level `static FOO: T = ...;` item.
@@ -721,7 +907,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             trace!("static excluded by attrs");
             return;
         }
-        syn::visit::visit_item_static(self, i);
+        self.in_const_eval_scope(|v| syn::visit::visit_item_static(v, i));
     }
 
     /// Visit an associated `const FOO: T = ...;` inside an `impl` block.
@@ -736,7 +922,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             trace!("associated const excluded by attrs");
             return;
         }
-        syn::visit::visit_impl_item_const(self, i);
+        self.in_const_eval_scope(|v| syn::visit::visit_impl_item_const(v, i));
     }
 
     /// Visit an associated `const FOO: T [= ...];` inside a `trait` block.
@@ -754,7 +940,26 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             trace!("trait associated const excluded by attrs");
             return;
         }
-        syn::visit::visit_trait_item_const(self, i);
+        self.in_const_eval_scope(|v| syn::visit::visit_trait_item_const(v, i));
+    }
+
+    /// Visit `[T; N]`: the length `N` is always evaluated at compile time,
+    /// even where the array type itself appears in ordinary runtime code.
+    fn visit_type_array(&mut self, i: &'ast syn::TypeArray) {
+        self.in_const_eval_scope(|v| syn::visit::visit_type_array(v, i));
+    }
+
+    /// Visit one generic argument, e.g. the `N` in `Foo<N>`.
+    ///
+    /// Only [`syn::GenericArgument::Const`] is compile-time-evaluated; type
+    /// and lifetime arguments are not expressions and the others carry their
+    /// own nested `Expr`/`Type` that this default traversal still reaches.
+    fn visit_generic_argument(&mut self, i: &'ast syn::GenericArgument) {
+        if matches!(i, syn::GenericArgument::Const(_)) {
+            self.in_const_eval_scope(|v| syn::visit::visit_generic_argument(v, i));
+        } else {
+            syn::visit::visit_generic_argument(self, i);
+        }
     }
 
     /// Visit `impl Foo { ...}` or `impl Debug for Foo { ... }`.
@@ -865,8 +1070,8 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             BinOp::Or(_) => vec![quote! { && }],
             BinOp::Lt(_) => vec![quote! { == }, quote! {>}, quote! { <= }],
             BinOp::Gt(_) => vec![quote! { == }, quote! {<}, quote! { >= }],
-            BinOp::Le(_) => vec![quote! {>}],
-            BinOp::Ge(_) => vec![quote! {<}],
+            BinOp::Le(_) => vec![quote! {>}, quote! {<}],
+            BinOp::Ge(_) => vec![quote! {<}, quote! {>}],
             BinOp::Add(_) => vec![quote! {-}, quote! {*}],
             BinOp::AddAssign(_) => vec![quote! {-=}, quote! {*=}],
             BinOp::Sub(_) | BinOp::Mul(_) => vec![quote! {+}, quote! {/}],
@@ -918,6 +1123,55 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                 }
             }
             syn::visit::visit_expr_unary(v, i);
+        });
+    }
+
+    fn visit_expr_if(&mut self, i: &'ast syn::ExprIf) {
+        let _span = trace_span!("if", line = i.if_token.span.start().line).entered();
+        if attrs_excluded(&i.attrs) {
+            trace!("if excluded by attrs");
+            return;
+        }
+        self.in_exclude_re_scope(&i.attrs, |v| {
+            // `if let` conditions are not `bool` and can't be replaced by a literal.
+            // A condition that already *is* a bool literal is covered by `BoolLiteral`.
+            if !matches!(&*i.cond, Expr::Let(_) | Expr::Lit(_)) {
+                let span: Span = i.cond.span().into();
+                v.collect_mutant(span, None, &quote! { true }, Genre::IfCondition);
+                // `if cond { break }` is how a `loop` ends: replacing the
+                // condition with `false` removes the only exit and hangs, which
+                // burns the whole per-mutant timeout without telling us anything
+                // about the tests. `true` is still generated: it makes the loop
+                // end early.
+                if v.control_flow_memo.block_contains_loop_exit(&i.then_branch) {
+                    trace!("skip `false` for an if that exits a loop");
+                } else {
+                    v.collect_mutant(span, None, &quote! { false }, Genre::IfCondition);
+                }
+            }
+            syn::visit::visit_expr_if(v, i);
+        });
+    }
+
+    fn visit_expr_while(&mut self, i: &'ast syn::ExprWhile) {
+        let _span = trace_span!("while", line = i.while_token.span.start().line).entered();
+        if attrs_excluded(&i.attrs) {
+            trace!("while excluded by attrs");
+            return;
+        }
+        self.in_exclude_re_scope(&i.attrs, |v| {
+            // Only `false`: `while true` hangs any loop without an unconditional
+            // `break`, burning the whole per-mutant timeout without distinguishing
+            // a good test suite from a bad one.
+            if !matches!(&*i.cond, Expr::Let(_) | Expr::Lit(_)) {
+                v.collect_mutant(
+                    i.cond.span().into(),
+                    None,
+                    &quote! { false },
+                    Genre::WhileCondition,
+                );
+            }
+            syn::visit::visit_expr_while(v, i);
         });
     }
 
@@ -977,8 +1231,55 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                     );
                 });
 
+            let guards_below = v.guard_spans.len();
+            v.guard_spans.extend(
+                i.arms
+                    .iter()
+                    .flat_map(|arm| &arm.guard)
+                    .map(|(_if, guard_expr)| -> Span { guard_expr.span().into() }),
+            );
             syn::visit::visit_expr_match(v, i);
+            v.guard_spans.truncate(guards_below);
         });
+    }
+
+    /// Never mutate anything inside an attribute.
+    ///
+    /// `syn`'s default traversal descends from the attributes of every item into
+    /// `Meta::NameValue` and then into an `Expr`, so without this a literal in
+    /// `#[doc = "..."]` or `#[foo = true]` would be treated as mutable code.
+    /// Attributes that affect mutation are read explicitly (`attrs_excluded`,
+    /// `in_exclude_re_scope`), never through this traversal.
+    fn visit_attribute(&mut self, _i: &'ast Attribute) {}
+
+    /// Never mutate anything inside a pattern.
+    ///
+    /// `syn` routes `Pat::Lit` through `visit_expr_lit`, and replacing `true` with
+    /// `false` in `match b { true => .., false => .. }` makes the match
+    /// non-exhaustive (E0004). Patterns contain no other mutable expressions.
+    fn visit_pat(&mut self, _i: &'ast syn::Pat) {}
+
+    /// Visit a literal expression, mutating `true` and `false` in place.
+    fn visit_expr_lit(&mut self, i: &'ast syn::ExprLit) {
+        if let syn::Lit::Bool(lit_bool) = &i.lit {
+            let span: Span = i.span().into();
+            // A literal that is the whole function body, or a whole match arm
+            // guard, is already mutated by `FnValue` or `MatchArmGuard`.
+            let duplicates_fn_value = self
+                .fn_context_stack
+                .last()
+                .is_some_and(|c| c.body_span == Some(span));
+            let duplicates_match_guard = self.guard_spans.contains(&span);
+            if !duplicates_fn_value && !duplicates_match_guard {
+                let replacement = if lit_bool.value {
+                    quote! { false }
+                } else {
+                    quote! { true }
+                };
+                self.collect_mutant(span, None, &replacement, Genre::BoolLiteral);
+            }
+        }
+        syn::visit::visit_expr_lit(self, i);
     }
 
     fn visit_expr_struct(&mut self, i: &'ast syn::ExprStruct) {
@@ -1025,8 +1326,9 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                                 field_name: field_name_str,
                                 struct_name: struct_name.clone(),
                             }),
+                            v.const_eval_depth > 0,
                         );
-                        if !v.excluded_by_attr_re(&mutant.name) {
+                        if !v.excluded_by_attr_re(mutant.full_name()) {
                             v.mutants.push(mutant);
                         }
                     }
@@ -1036,6 +1338,67 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             syn::visit::visit_expr_struct(v, i);
         });
     }
+
+    /// Visit a block, generating a mutant that deletes each discardable statement.
+    fn visit_block(&mut self, i: &'ast Block) {
+        // Locals declared in this block without a type annotation: deleting a
+        // statement that is the only use of one of them can make its type
+        // uninferable (E0282, as in `let mut v = Vec::new(); v.push(1);`) or leave
+        // it uninitialized (E0381).
+        let untyped_locals = untyped_local_idents(i);
+        for stmt in &i.stmts {
+            if let Stmt::Expr(expr, Some(semi)) = stmt
+                && is_deletable_statement(expr, &untyped_locals, &mut self.control_flow_memo)
+                && !self.is_skipped_call(expr)
+            {
+                let span = Span {
+                    start: expr.span().start().into(),
+                    end: semi.span().end().into(),
+                };
+                self.collect_mutant(span, None, &quote! {}, Genre::DeleteStatement);
+            }
+        }
+        syn::visit::visit_block(self, i);
+    }
+
+    fn visit_expr_closure(&mut self, i: &'ast syn::ExprClosure) {
+        // A `return` inside a closure returns from the closure, whose return type
+        // is usually inferred and so unknown here.
+        self.closure_depth += 1;
+        syn::visit::visit_expr_closure(self, i);
+        self.closure_depth -= 1;
+    }
+
+    fn visit_expr_async(&mut self, i: &'ast syn::ExprAsync) {
+        self.closure_depth += 1;
+        syn::visit::visit_expr_async(self, i);
+        self.closure_depth -= 1;
+    }
+
+    /// Visit `return expr`, replacing the returned value with fixed values of
+    /// the enclosing function's declared return type.
+    fn visit_expr_return(&mut self, i: &'ast syn::ExprReturn) {
+        if self.closure_depth == 0
+            && let Some(expr) = &i.expr
+            && let Some(context) = self.fn_context_stack.last()
+            // A function whose whole body is `return expr;` already has an
+            // identical `FnValue` mutant.
+            && !context.body_is_single_return
+            && let ReturnType::Type(..) = &context.output
+        {
+            let original = expr.to_token_stream().to_pretty_string();
+            let span: Span = expr.span().into();
+            let output = context.output.clone();
+            for rep in return_type_replacements(&output, self.error_exprs, self.enums) {
+                if rep.to_pretty_string() == original {
+                    trace!("Replacement is the same as the returned expression; skipping");
+                } else {
+                    self.collect_mutant(span, None, &rep, Genre::ReturnValue);
+                }
+            }
+        }
+        syn::visit::visit_expr_return(self, i);
+    }
 }
 
 // Get the span of the block excluding the braces, or None if it is empty.
@@ -1044,6 +1407,173 @@ fn function_body_span(block: &Block) -> Option<Span> {
         start: block.stmts.first()?.span().start().into(),
         end: block.stmts.last()?.span().end().into(),
     })
+}
+
+/// Idents bound by `let` in this block with no type annotation.
+fn untyped_local_idents(block: &Block) -> HashSet<String> {
+    block
+        .stmts
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Local(local) => match &local.pat {
+                syn::Pat::Ident(pat_ident) => Some(pat_ident.ident.to_string()),
+                // `let x: T = ...` is `Pat::Type`, whose type is known without
+                // looking at any later statement.
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a statement expression can be deleted without changing the types of
+/// anything around it.
+///
+/// Accepts only calls, method calls, and plain assignments: a statement with a
+/// semicolon has type `()` regardless of the expression's type, so removing it
+/// can't change the block's type. Compound assignments (`n -= 1`) are
+/// `Expr::Binary` in syn and so are excluded, which also keeps us from deleting
+/// the increment of a loop and hanging.
+fn is_deletable_statement(
+    expr: &Expr,
+    untyped_locals: &HashSet<String>,
+    control_flow_memo: &mut ControlFlowMemo,
+) -> bool {
+    let root = match expr {
+        Expr::MethodCall(method_call) => root_ident(&method_call.receiver),
+        Expr::Assign(assign) => root_ident(&assign.left),
+        Expr::Call(_) => None,
+        _ => return false,
+    };
+    if root.is_some_and(|ident| untyped_locals.contains(&ident)) {
+        return false;
+    }
+    !control_flow_memo.contains_control_flow(expr)
+}
+
+/// The base ident of a place expression: `v` for `v`, `v.field`, `v[0]`, `*v`.
+fn root_ident(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Path(ExprPath { path, .. }) => path.get_ident().map(ToString::to_string),
+        Expr::Field(field) => root_ident(&field.base),
+        Expr::Index(index) => root_ident(&index.expr),
+        Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => root_ident(&unary.expr),
+        Expr::Paren(paren) => root_ident(&paren.expr),
+        _ => None,
+    }
+}
+
+/// Whether `return`, `break`, or `continue` occurs within a syntax subtree,
+/// memoized by node identity.
+///
+/// `is_deletable_statement` and `visit_expr_if` ask this question of every
+/// statement/`if` in a file, and `syn::visit::visit_block` then descends
+/// into nested blocks and asks it again of their statements. Without
+/// memoization, a chain of D nested single-statement blocks costs O(D^2):
+/// each of the D queries walks the whole remaining subtree. Caching each
+/// node's answer the first time it is fully walked makes the total work
+/// linear in the size of the AST, because the first (outermost) query
+/// populates the cache for every node underneath it, and every later query
+/// on a node it already covered is an O(1) lookup.
+///
+/// Keyed on the raw pointer of the node: the AST is borrowed for the whole
+/// file walk and never mutated, so pointers stay valid and stable for the
+/// lifetime of this cache.
+///
+/// This intentionally mirrors the exact traversal of the previous
+/// non-memoized `ControlFlowFinder`: only `return`, `break`, and `continue`
+/// expressions are treated as leaves (their own sub-expressions, e.g. the
+/// value of `return expr`, are not walked), and every other node — including
+/// nested closures and loops — is walked as `syn::visit`'s default
+/// implementation would.
+
+#[derive(Default)]
+struct ControlFlowMemo {
+    /// Whether a `return` has been seen in the subtree currently being walked.
+    returns: bool,
+    /// Whether a `break` or `continue` has been seen in the subtree currently being walked.
+    loop_exits: bool,
+    expr_memo: HashMap<*const Expr, (bool, bool)>,
+    block_memo: HashMap<*const Block, (bool, bool)>,
+}
+
+impl ControlFlowMemo {
+    /// Whether the expression contains `return`, `break`, or `continue` anywhere.
+    fn contains_control_flow(&mut self, expr: &Expr) -> bool {
+        let (returns, loop_exits) = self.query_expr(expr);
+        returns || loop_exits
+    }
+
+    /// Whether the block contains a `break` or `continue` anywhere, i.e. whether
+    /// reaching it is how some enclosing loop ends or advances.
+    fn block_contains_loop_exit(&mut self, block: &Block) -> bool {
+        self.query_block(block).1
+    }
+
+    /// Compute (or fetch the cached) `(returns, loop_exits)` for `expr`, and
+    /// fold that answer into the accumulator for whichever subtree is
+    /// currently being walked.
+    fn query_expr(&mut self, expr: &Expr) -> (bool, bool) {
+        let ptr: *const Expr = expr;
+        let mine = if let Some(&cached) = self.expr_memo.get(&ptr) {
+            cached
+        } else {
+            let outer = (self.returns, self.loop_exits);
+            self.returns = false;
+            self.loop_exits = false;
+            syn::visit::visit_expr(self, expr);
+            let mine = (self.returns, self.loop_exits);
+            self.expr_memo.insert(ptr, mine);
+            self.returns = outer.0;
+            self.loop_exits = outer.1;
+            mine
+        };
+        self.returns |= mine.0;
+        self.loop_exits |= mine.1;
+        mine
+    }
+
+    /// As [`Self::query_expr`], but for a block.
+    fn query_block(&mut self, block: &Block) -> (bool, bool) {
+        let ptr: *const Block = block;
+        let mine = if let Some(&cached) = self.block_memo.get(&ptr) {
+            cached
+        } else {
+            let outer = (self.returns, self.loop_exits);
+            self.returns = false;
+            self.loop_exits = false;
+            syn::visit::visit_block(self, block);
+            let mine = (self.returns, self.loop_exits);
+            self.block_memo.insert(ptr, mine);
+            self.returns = outer.0;
+            self.loop_exits = outer.1;
+            mine
+        };
+        self.returns |= mine.0;
+        self.loop_exits |= mine.1;
+        mine
+    }
+}
+
+impl<'ast> Visit<'ast> for ControlFlowMemo {
+    fn visit_expr(&mut self, i: &'ast Expr) {
+        self.query_expr(i);
+    }
+    fn visit_block(&mut self, i: &'ast Block) {
+        self.query_block(i);
+    }
+    // `return`/`break`/`continue` are leaves for this analysis: their own
+    // sub-expressions are deliberately not walked, matching the previous
+    // `ControlFlowFinder`.
+    fn visit_expr_return(&mut self, _i: &'ast syn::ExprReturn) {
+        self.returns = true;
+    }
+    fn visit_expr_break(&mut self, _i: &'ast syn::ExprBreak) {
+        self.loop_exits = true;
+    }
+    fn visit_expr_continue(&mut self, _i: &'ast syn::ExprContinue) {
+        self.loop_exits = true;
+    }
 }
 
 /// Find a new source file referenced by a `mod` statement.
@@ -1388,6 +1918,124 @@ mod test {
     mod skip_attr_trait;
     mod skip_attr_trait_item_const;
 
+    /// The memoized control-flow lookup must agree with a fresh, non-memoized
+    /// walk. Nesting a `helper(BLOCK)` call chain many levels deep, where
+    /// each level's `helper(...)` argument is the whole nested subtree below
+    /// it, exercises exactly the scenario the memo cache is built for: an
+    /// outer level's `contains_control_flow` query walks (and caches) every
+    /// node below it, and every inner level then re-queries a node the outer
+    /// query already covered. A `break`/`return` planted at the bottom of
+    /// the chain must still be found through every `helper(...)` level above
+    /// it despite the cache, while the sibling `log(...)` statement at each
+    /// level — which does not contain the break/return — must still be
+    /// judged deletable: a memo that leaked one sibling's flag into another's
+    /// cached entry would fail this either by under- or over-reporting.
+    #[test]
+    fn nested_call_chain_with_deep_control_flow_is_detected_through_the_memo_cache() {
+        fn block_at(i: usize, depth: usize, tail: &str) -> String {
+            if i == depth - 1 {
+                format!("{{ let x{i} = compute({i}); log(x{i}); {tail} }}")
+            } else {
+                format!(
+                    "{{ let x{i} = compute({i}); log(x{i}); helper({}); 0 }}",
+                    block_at(i + 1, depth, tail)
+                )
+            }
+        }
+        let depth = 40;
+        let with_break = format!(
+            "fn f(n: i32) -> i32 {{
+                loop {{
+                    helper({});
+                }}
+                0
+            }}
+            fn helper(x: i32) -> i32 {{ x }}
+            fn compute(n: i32) -> i32 {{ n }}
+            fn log(_n: i32) {{}}
+            ",
+            block_at(0, depth, "break; 0")
+        );
+        // Every `helper(...)` statement transitively contains the `break` at
+        // the bottom of the chain (it's nested in its own argument), so none
+        // of them should be offered as a `DeleteStatement` mutant: deleting
+        // one would remove the loop's only exit. The sibling `log(...)` at
+        // each level does not contain the `break` and must remain deletable.
+        let mutants = mutate_source_str(&with_break, &Options::default()).unwrap();
+        let delete_statement_names = mutants
+            .iter()
+            .filter(|m| m.genre == Genre::DeleteStatement)
+            .map(|m| m.name(false))
+            .collect_vec();
+        assert_eq!(
+            delete_statement_names.len(),
+            depth,
+            "only the {depth} `log(...)` statements should be deletable, got {delete_statement_names:?}"
+        );
+        assert!(
+            delete_statement_names
+                .iter()
+                .all(|n| !n.contains("helper(")),
+            "no `helper(...)` statement should be deletable: each one contains \
+             the `break` further down, but got {delete_statement_names:?}"
+        );
+
+        // Same chain with `return 0` instead of `break` at the bottom: also
+        // must be detected as control flow through every level of the cache.
+        let with_return = format!(
+            "fn f(n: i32) -> i32 {{
+                helper({});
+                0
+            }}
+            fn helper(x: i32) -> i32 {{ x }}
+            fn compute(n: i32) -> i32 {{ n }}
+            fn log(_n: i32) {{}}
+            ",
+            block_at(0, depth, "return 0; 0")
+        );
+        let mutants = mutate_source_str(&with_return, &Options::default()).unwrap();
+        let delete_statement_names = mutants
+            .iter()
+            .filter(|m| m.genre == Genre::DeleteStatement)
+            .map(|m| m.name(false))
+            .collect_vec();
+        assert_eq!(
+            delete_statement_names.len(),
+            depth,
+            "only the {depth} `log(...)` statements should be deletable, got {delete_statement_names:?}"
+        );
+        assert!(
+            delete_statement_names
+                .iter()
+                .all(|n| !n.contains("helper(")),
+            "no `helper(...)` statement should be deletable: each one contains \
+             the `return` further down, but got {delete_statement_names:?}"
+        );
+
+        // Sanity check: the very same chain with a plain `0` tail (no control
+        // flow at all) makes every `helper(...)`/`log(...)` statement
+        // deletable, so the assertions above are exercising real detection
+        // and not e.g. some unrelated exclusion.
+        let without_control_flow = format!(
+            "fn f(n: i32) -> i32 {{
+                helper({});
+                0
+            }}
+            fn helper(x: i32) -> i32 {{ x }}
+            fn compute(n: i32) -> i32 {{ n }}
+            fn log(_n: i32) {{}}
+            ",
+            block_at(0, depth, "0")
+        );
+        let mutants = mutate_source_str(&without_control_flow, &Options::default()).unwrap();
+        let delete_statement_count = mutants
+            .iter()
+            .filter(|m| m.genre == Genre::DeleteStatement)
+            .count();
+        // One `helper(...)` and one `log(...)` deletable statement per level.
+        assert_eq!(delete_statement_count, depth * 2);
+    }
+
     #[test]
     fn path_ends_with() {
         use super::path_ends_with;
@@ -1416,8 +2064,7 @@ mod test {
             fn always_true() -> bool { true }
         "};
         let source_file = SourceFile::for_tests("src/lib.rs", code, "unimportant", true);
-        let (mutants, _files) =
-            walk_file(&source_file, &Options::default()).expect("walk_file");
+        let (mutants, _files) = walk_file(&source_file, &Options::default()).expect("walk_file");
         let mutant_names = mutants.iter().map(|m| m.name(false)).collect_vec();
         // It would be good to suggest replacing this with 'false', breaking a key behavior,
         // but bad to replace it with 'true', changing nothing.
@@ -1665,6 +2312,31 @@ mod test {
     }
 
     #[test]
+    fn skip_false_if_condition_that_would_remove_a_loop_exit() {
+        let mutants = mutate_source_str(
+            indoc! {"
+                fn main() {
+                    loop {
+                        if done() {
+                            break;
+                        }
+                    }
+                }
+            "},
+            &Options::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            mutants
+                .iter()
+                .filter(|m| m.genre == Genre::IfCondition)
+                .map(|m| m.name(true))
+                .collect_vec(),
+            ["src/main.rs:3:12: replace done() with true in main"]
+        );
+    }
+
+    #[test]
     fn skip_with_capacity_by_default() {
         let options = Options::from_arg_strs(["mutants"]);
         let mut mutants = mutate_source_str(
@@ -1793,6 +2465,304 @@ mod test {
     }
 
     #[test]
+    fn mutate_if_condition() {
+        let mutants = mutate_source_str(
+            indoc! {"
+                fn main() {
+                    if foo() {
+                        bar();
+                    }
+                }
+            "},
+            &Options::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            mutants
+                .iter()
+                .filter(|m| m.genre == Genre::IfCondition)
+                .map(|m| m.name(true))
+                .collect_vec(),
+            [
+                "src/main.rs:2:8: replace foo() with true in main",
+                "src/main.rs:2:8: replace foo() with false in main",
+            ]
+        );
+    }
+
+    #[test]
+    fn skip_if_let_condition() {
+        // `if let` is not a bool condition, but mutants inside the body are still found.
+        let mutants = mutate_source_str(
+            indoc! {"
+                fn main() {
+                    if let Some(x) = foo() {
+                        let _ = x > 1;
+                    }
+                }
+            "},
+            &Options::default(),
+        )
+        .unwrap();
+        assert!(!mutants.iter().any(|m| m.genre == Genre::IfCondition));
+        assert!(mutants.iter().any(|m| m.genre == Genre::BinaryOperator));
+    }
+
+    #[test]
+    fn mutate_while_condition_only_to_false() {
+        let mutants = mutate_source_str(
+            indoc! {"
+                fn main() {
+                    let mut n = 10;
+                    while n > 0 {
+                        n -= 1;
+                    }
+                }
+            "},
+            &Options::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            mutants
+                .iter()
+                .filter(|m| m.genre == Genre::WhileCondition)
+                .map(|m| m.name(true))
+                .collect_vec(),
+            ["src/main.rs:3:11: replace n > 0 with false in main"]
+        );
+    }
+
+    /// Names of the `DeleteStatement` mutants generated from `code`.
+    fn delete_statement_mutants(code: &str) -> Vec<String> {
+        mutate_source_str(code, &Options::default())
+            .unwrap()
+            .iter()
+            .filter(|m| m.genre == Genre::DeleteStatement)
+            .map(|m| m.describe_change().to_owned())
+            .collect_vec()
+    }
+
+    #[test]
+    fn delete_method_call_statement() {
+        assert_eq!(
+            delete_statement_mutants(indoc! {"
+                fn f(v: &mut Vec<u32>) {
+                    v.push(1);
+                }
+            "}),
+            ["delete v.push(1); in f"]
+        );
+    }
+
+    #[test]
+    fn skip_deleting_statement_using_an_untyped_local() {
+        assert_eq!(
+            delete_statement_mutants(indoc! {"
+                fn f() {
+                    let mut v = Vec::new();
+                    v.push(1);
+                }
+            "}),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn delete_statement_using_a_typed_local() {
+        assert_eq!(
+            delete_statement_mutants(indoc! {"
+                fn f() {
+                    let mut v: Vec<u32> = Vec::new();
+                    v.push(1);
+                }
+            "}),
+            ["delete v.push(1); in f"]
+        );
+    }
+
+    #[test]
+    fn skip_deleting_compound_assignment_macro_and_try_statements() {
+        assert_eq!(
+            delete_statement_mutants(indoc! {"
+                fn f(mut n: u32, x: bool) -> Result<(), Error> {
+                    n -= 1;
+                    assert!(x);
+                    foo()?;
+                    Ok(())
+                }
+            "}),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn delete_assignment_to_a_parameter() {
+        assert_eq!(
+            delete_statement_mutants(indoc! {"
+                fn f(mut x: u32) -> u32 {
+                    x = 1;
+                    x
+                }
+            "}),
+            ["delete x = 1; in f"]
+        );
+    }
+
+    #[test]
+    fn mutate_bool_literal_in_let() {
+        let mutants = mutate_source_str(
+            indoc! {"
+                fn f() {
+                    let x = true;
+                }
+            "},
+            &Options::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            mutants
+                .iter()
+                .filter(|m| m.genre == Genre::BoolLiteral)
+                .map(|m| m.name(true))
+                .collect_vec(),
+            ["src/main.rs:2:13: replace true with false in f"]
+        );
+    }
+
+    #[test]
+    fn mutate_early_return_value() {
+        let mutants = mutate_source_str(
+            indoc! {"
+                fn f(n: i32) -> i32 {
+                    if n < 0 {
+                        return 0;
+                    }
+                    n * 2
+                }
+            "},
+            &Options::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            mutants
+                .iter()
+                .filter(|m| m.genre == Genre::ReturnValue)
+                .map(|m| m.name(true))
+                .collect_vec(),
+            [
+                "src/main.rs:3:16: replace 0 with 1 in f",
+                "src/main.rs:3:16: replace 0 with -1 in f",
+            ]
+        );
+    }
+
+    #[test]
+    fn skip_return_value_when_body_is_a_single_return() {
+        let mutants = mutate_source_str(
+            indoc! {"
+                fn f() -> i32 {
+                    return 7;
+                }
+            "},
+            &Options::default(),
+        )
+        .unwrap();
+        assert!(!mutants.iter().any(|m| m.genre == Genre::ReturnValue));
+        assert!(mutants.iter().any(|m| m.genre == Genre::FnValue));
+    }
+
+    #[test]
+    fn skip_return_value_inside_a_closure() {
+        let mutants = mutate_source_str(
+            indoc! {"
+                fn f() -> i32 {
+                    let g = || {
+                        return 3;
+                    };
+                    g()
+                }
+            "},
+            &Options::default(),
+        )
+        .unwrap();
+        assert!(!mutants.iter().any(|m| m.genre == Genre::ReturnValue));
+    }
+
+    #[test]
+    fn skip_bool_literal_that_is_the_whole_function_body() {
+        let mutants = mutate_source_str(
+            indoc! {"
+                fn f() -> bool {
+                    true
+                }
+            "},
+            &Options::default(),
+        )
+        .unwrap();
+        assert!(!mutants.iter().any(|m| m.genre == Genre::BoolLiteral));
+        assert!(mutants.iter().any(|m| m.genre == Genre::FnValue));
+    }
+
+    #[test]
+    fn skip_bool_literal_that_is_a_whole_match_guard() {
+        let mutants = mutate_source_str(
+            indoc! {"
+                fn f(x: Option<u32>) -> u32 {
+                    match x {
+                        Some(_) if true => 1,
+                        _ => 2,
+                    }
+                }
+            "},
+            &Options::default(),
+        )
+        .unwrap();
+        assert!(!mutants.iter().any(|m| m.genre == Genre::BoolLiteral));
+        assert!(mutants.iter().any(|m| m.genre == Genre::MatchArmGuard));
+    }
+
+    #[test]
+    fn skip_bool_literals_in_patterns_and_attributes() {
+        let mutants = mutate_source_str(
+            indoc! {r#"
+                #[doc = "documentation"]
+                fn g(b: bool) -> u32 {
+                    match b {
+                        true => 1,
+                        false => 2,
+                    }
+                }
+            "#},
+            &Options::default(),
+        )
+        .unwrap();
+        assert!(!mutants.iter().any(|m| m.genre == Genre::BoolLiteral));
+    }
+
+    #[test]
+    fn return_same_file_enum_unit_variants() {
+        let mutants = mutate_source_str(
+            indoc! {"
+                enum Colour { Red, Green, Custom(u32) }
+
+                fn pick() -> Colour {
+                    Colour::Red
+                }
+            "},
+            &Options::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            mutants
+                .iter()
+                .filter(|m| m.genre == Genre::FnValue)
+                .map(|m| m.replacement_text().to_owned())
+                .collect_vec(),
+            ["Colour::Green"]
+        );
+    }
+
+    #[test]
     fn skip_match_arms_without_fallback() {
         let options = Options::default();
         let mutants = mutate_source_str(
@@ -1893,8 +2863,14 @@ mod test {
         );
         assert_eq!(mutate_expr("a == b"), &["replace == with !="]);
         assert_eq!(mutate_expr("a != b"), &["replace != with =="]);
-        assert_eq!(mutate_expr("a >= b"), &["replace >= with <"]);
-        assert_eq!(mutate_expr("a <= b"), &["replace <= with >"]);
+        assert_eq!(
+            mutate_expr("a >= b"),
+            &["replace >= with <", "replace >= with >"]
+        );
+        assert_eq!(
+            mutate_expr("a <= b"),
+            &["replace <= with >", "replace <= with <"]
+        );
     }
 
     #[test]
@@ -2072,7 +3048,7 @@ mod test {
             &options,
         )
         .unwrap();
-        let names: Vec<&str> = mutants.iter().map(|m| m.name.as_str()).collect();
+        let names: Vec<&str> = mutants.iter().map(Mutant::full_name).collect();
         // "replace add -> i32 with 0" should be filtered out, but
         // "replace add -> i32 with 1", "with -1", and the binary operator
         // mutations on the body should still be present.
@@ -2257,7 +3233,7 @@ mod test {
             &options,
         )
         .unwrap();
-        let names: Vec<&str> = mutants.iter().map(|m| m.name.as_str()).collect();
+        let names: Vec<&str> = mutants.iter().map(Mutant::full_name).collect();
         // is_ok fn replacement should be excluded, but count fn and binary ops should remain
         assert!(
             !names.iter().any(|n| n.contains("is_ok")),
@@ -2282,7 +3258,7 @@ mod test {
             &options,
         )
         .unwrap();
-        let names: Vec<&str> = mutants.iter().map(|m| m.name.as_str()).collect();
+        let names: Vec<&str> = mutants.iter().map(Mutant::full_name).collect();
         assert!(
             !names.iter().any(|n| n.contains("with 0")),
             "should not contain 'with 0' mutant but got: {names:?}"
@@ -2311,7 +3287,7 @@ mod test {
             &options,
         )
         .unwrap();
-        let names: Vec<&str> = mutants.iter().map(|m| m.name.as_str()).collect();
+        let names: Vec<&str> = mutants.iter().map(Mutant::full_name).collect();
         assert!(
             !names.iter().any(|n| n.contains("is_ok")),
             "should not contain is_ok mutant but got: {names:?}"
@@ -2340,7 +3316,7 @@ mod test {
             &options,
         )
         .unwrap();
-        let names: Vec<&str> = mutants.iter().map(|m| m.name.as_str()).collect();
+        let names: Vec<&str> = mutants.iter().map(Mutant::full_name).collect();
         assert!(
             !names.iter().any(|n| n.contains("is_ok")),
             "should not contain is_ok mutant but got: {names:?}"
@@ -2368,7 +3344,7 @@ mod test {
             &options,
         )
         .unwrap();
-        let names: Vec<&str> = mutants.iter().map(|m| m.name.as_str()).collect();
+        let names: Vec<&str> = mutants.iter().map(Mutant::full_name).collect();
         assert!(
             !names.iter().any(|n| n.contains("is_ok")),
             "should not contain is_ok mutant but got: {names:?}"
@@ -2402,7 +3378,7 @@ mod test {
             &options,
         )
         .unwrap();
-        let names: Vec<&str> = mutants.iter().map(|m| m.name.as_str()).collect();
+        let names: Vec<&str> = mutants.iter().map(Mutant::full_name).collect();
         // is_ok: excluded by impl-level pattern (-> bool)
         assert!(
             !names.iter().any(|n| n.contains("is_ok")),

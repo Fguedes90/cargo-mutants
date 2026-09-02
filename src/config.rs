@@ -48,6 +48,8 @@ pub struct Config {
     pub copy_vcs: Option<bool>,
     /// Copy the /target directory to build directories.
     pub copy_target: Option<bool>,
+    /// Detect mutants that build to identical machine code and don't test them.
+    pub detect_equivalent_mutants: Option<bool>,
     /// Generate these error values from functions returning Result.
     pub error_values: Vec<String>,
     /// Generate mutants from source files matching these globs.
@@ -78,6 +80,8 @@ pub struct Config {
     pub skip_calls: Vec<String>,
     /// Use built-in defaults for `skip_calls` in addition to any explicit values.
     pub skip_calls_defaults: Option<bool>,
+    /// Don't build or test mutants in code that the test suite never runs.
+    pub skip_uncovered: Option<bool>,
     /// Run tests from these packages for all mutants.
     pub test_package: Vec<String>,
 

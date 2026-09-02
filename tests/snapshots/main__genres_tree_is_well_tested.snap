@@ -1,0 +1,42 @@
+---
+source: tests/main.rs
+expression: stdout
+snapshot_kind: text
+---
+Found 33 mutants to test
+ok       Unmutated baseline
+caught   src/lib.rs:9:5: replace classify -> &'static str with ""
+caught   src/lib.rs:9:5: replace classify -> &'static str with "xyzzy"
+caught   src/lib.rs:9:8: replace n > 10 with true in classify
+caught   src/lib.rs:9:8: replace n > 10 with false in classify
+caught   src/lib.rs:9:10: replace > with == in classify
+caught   src/lib.rs:9:10: replace > with < in classify
+caught   src/lib.rs:9:10: replace > with >= in classify
+caught   src/lib.rs:19:5: replace colour_of -> Colour with Colour::Red
+caught   src/lib.rs:19:5: replace colour_of -> Colour with Colour::Green
+caught   src/lib.rs:19:8: replace flag with true in colour_of
+caught   src/lib.rs:19:8: replace flag with false in colour_of
+caught   src/lib.rs:23:5: replace is_enabled -> bool with true
+caught   src/lib.rs:23:5: replace is_enabled -> bool with false
+caught   src/lib.rs:23:19: replace true with false in is_enabled
+caught   src/lib.rs:24:13: replace && with || in is_enabled
+caught   src/lib.rs:24:16: delete ! in is_enabled
+caught   src/lib.rs:28:5: replace push_twice with ()
+caught   src/lib.rs:28:5: delete v.push(1); in push_twice
+caught   src/lib.rs:29:5: delete v.push(2); in push_twice
+caught   src/lib.rs:33:5: replace early -> i32 with 0
+caught   src/lib.rs:33:5: replace early -> i32 with 1
+caught   src/lib.rs:33:5: replace early -> i32 with -1
+caught   src/lib.rs:33:8: replace n < 0 with true in early
+caught   src/lib.rs:33:8: replace n < 0 with false in early
+caught   src/lib.rs:33:10: replace < with == in early
+caught   src/lib.rs:33:10: replace < with > in early
+caught   src/lib.rs:33:10: replace < with <= in early
+caught   src/lib.rs:34:16: replace 0 with 1 in early
+caught   src/lib.rs:34:16: replace 0 with -1 in early
+caught   src/lib.rs:36:11: replace + with - in early
+caught   src/lib.rs:36:11: replace + with * in early
+caught   src/lib.rs:36:7: replace * with + in early
+caught   src/lib.rs:36:7: replace * with / in early
+33 mutants tested: 33 caught
+

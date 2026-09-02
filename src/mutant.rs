@@ -3,7 +3,8 @@
 //! Mutations to source files, and inference of interesting mutations to apply.
 
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::fmt;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use console::{StyledObject, style};
@@ -30,6 +31,16 @@ pub enum Genre {
     MatchArm,
     /// Replace the expression of a match arm guard with a fixed value.
     MatchArmGuard,
+    /// Replace the condition of an `if` expression with a fixed value.
+    IfCondition,
+    /// Replace the condition of a `while` expression with `false`.
+    WhileCondition,
+    /// Replace a `true` literal with `false`, or vice versa.
+    BoolLiteral,
+    /// Delete a statement whose value is discarded.
+    DeleteStatement,
+    /// Replace the value of an explicit `return` with a fixed value.
+    ReturnValue,
     /// Delete a field from a struct literal that has a base (default) expression.
     StructField,
 }
@@ -47,21 +58,30 @@ pub enum MutationTarget {
 }
 
 /// A mutation applied to source code.
-#[derive(Clone, Eq, PartialEq, Debug)]
+#[derive(Clone)]
 pub struct Mutant {
-    /// A precomputed human-readable name for this mutant, including the file,
-    /// location, and change description.
+    /// The human-readable name of this mutant: file, line/column, and change
+    /// description, as returned by `name(true)`.
     ///
-    /// This is used in CLI output, filtering, and JSON.
-    pub name: String,
+    /// Built on demand and cached: a name is needed for output and for the
+    /// name filters, but a candidate that is discarded by
+    /// `#[mutants::exclude_re]` or by an unset filter never needs one.
+    name: OnceLock<String>,
 
     /// The change this mutant makes, without the file location: the part of
     /// `name` after the path.
     ///
-    /// Precomputed because building it walks the styled parts of the mutant,
-    /// which is the expensive half of forming a name, and both `name` and
+    /// Cached because building it walks the styled parts of the mutant, which
+    /// is the expensive half of forming a name, and both `name` and
     /// `name(false)` need exactly the same text.
-    change_description: String,
+    change_description: OnceLock<String>,
+
+    /// The unified diff of this mutant against the original file.
+    ///
+    /// Cached because it is needed both when `mutants.json` is written, before
+    /// any mutant is tested, and again when the mutant is applied; computing
+    /// it diffs the whole file.
+    diff: OnceLock<String>,
 
     /// Which file is being mutated.
     pub source_file: SourceFile,
@@ -96,6 +116,59 @@ pub struct Mutant {
     /// This provides structured information about the mutation target, rather than
     /// encoding it in strings that need to be parsed.
     pub target: Option<MutationTarget>,
+
+    /// Whether this mutant lives inside a construct the compiler evaluates
+    /// at compile time: a `const`/`static` initializer, a `const fn` body,
+    /// an array-length expression, or a const generic argument.
+    ///
+    /// Such positions have no coverage counter (`-Cinstrument-coverage`
+    /// reaches only code the compiled program executes at runtime), even
+    /// though a test can still catch the mutant by asserting on the
+    /// resulting value. `--skip-uncovered` reads this to avoid skipping a
+    /// mutant it cannot truthfully call uncovered.
+    ///
+    /// This is derived, deterministic metadata about *where* the mutant is,
+    /// not part of *what change* it makes, so it is excluded from
+    /// [`PartialEq`], [`fmt::Debug`], and [`Serialize`]: two mutants that
+    /// make the same change at the same place are still the same mutant,
+    /// and `mutants.json`/`--list --json` must not change shape.
+    pub const_eval: bool,
+}
+
+/// Two mutants are the same if they make the same change to the same place:
+/// the lazily-built caches are derived data, so whether they happen to be
+/// filled must not affect equality.
+impl PartialEq for Mutant {
+    fn eq(&self, other: &Self) -> bool {
+        self.source_file == other.source_file
+            && self.function == other.function
+            && self.span == other.span
+            && self.short_replaced == other.short_replaced
+            && self.replacement == other.replacement
+            && self.genre == other.genre
+            && self.target == other.target
+    }
+}
+
+impl Eq for Mutant {}
+
+/// The debug form deliberately omits the lazily-built name, description, and
+/// diff: they are derived, and the diff would drag the whole source file into
+/// the output.
+#[allow(clippy::missing_fields_in_debug)] // intentional; see above
+impl fmt::Debug for Mutant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Mutant")
+            .field("source_file", &self.source_file)
+            .field("function", &self.function)
+            .field("span", &self.span)
+            .field("short_replaced", &self.short_replaced)
+            .field("replacement", &self.replacement)
+            .field("genre", &self.genre)
+            .field("target", &self.target)
+            .field("const_eval", &self.const_eval)
+            .finish()
+    }
 }
 
 /// The function containing a mutant.
@@ -119,9 +192,12 @@ pub struct Function {
 impl Mutant {
     /// Construct a mutant discovered while walking source code.
     ///
-    /// This initializes all fields and precomputes the human-readable `name`
-    /// (including file path, line/column, and change description) for use in
-    /// CLI output, filtering, and JSON.
+    /// The human-readable name and the diff are not built here: they are
+    /// computed on first use and cached, so a candidate that is discarded by
+    /// a filter costs nothing to name.
+    // All of it is discovered separately while walking the AST, and grouping
+    // parts of it into a struct would only move the argument list.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_discovered(
         source_file: SourceFile,
         function: Option<Arc<Function>>,
@@ -130,10 +206,12 @@ impl Mutant {
         replacement: String,
         genre: Genre,
         target: Option<MutationTarget>,
+        const_eval: bool,
     ) -> Self {
-        let mut mutant = Mutant {
-            name: String::new(),
-            change_description: String::new(),
+        Mutant {
+            name: OnceLock::new(),
+            change_description: OnceLock::new(),
+            diff: OnceLock::new(),
             source_file,
             function,
             span,
@@ -141,18 +219,22 @@ impl Mutant {
             replacement,
             genre,
             target,
-        };
-        mutant.change_description = mutant
-            .styled_parts()
-            .into_iter()
-            .map(|x| x.force_styling(false).to_string())
-            .collect();
-        mutant.name = mutant.name(true);
-        mutant
+            const_eval,
+        }
     }
 
     /// Return text of the whole file with the mutation applied.
+    ///
+    /// The replacement is followed by [`MUTATION_MARKER_COMMENT`]. Every genre
+    /// builds its replacement by printing a `TokenStream`, which can't contain
+    /// a comment, so the marker can't be swallowed by an unterminated comment
+    /// in the replacement; the assertion below holds any new genre to that.
     pub fn mutated_code(&self) -> String {
+        debug_assert!(
+            !self.replacement.contains("/*") && !self.replacement.contains("//"),
+            "replacement {:?} opens a comment, which would swallow the mutation marker",
+            self.replacement
+        );
         self.span.replace_indexed(
             self.source_file.code(),
             self.source_file.line_index(),
@@ -163,20 +245,40 @@ impl Mutant {
     /// Describe the mutant briefly, not including the location.
     ///
     /// The result is like `replace factorial -> u32 with Default::default()`.
-    pub fn describe_change(&self) -> String {
-        self.change_description.clone()
+    pub fn describe_change(&self) -> &str {
+        self.change_description.get_or_init(|| {
+            self.styled_parts()
+                .into_iter()
+                .map(|x| x.force_styling(false).to_string())
+                .collect()
+        })
+    }
+
+    /// The full name of this mutant, including the line and column.
+    ///
+    /// This is the name used by the name filters, by `mutants.json`, and by
+    /// the caught/missed list files, so it is cached.
+    pub fn full_name(&self) -> &str {
+        self.name.get_or_init(|| {
+            format!(
+                "{path}:{line}:{col}: {description}",
+                path = self.source_file.tree_relative_slashes(),
+                line = self.span.start.line,
+                col = self.span.start.column,
+                description = self.describe_change(),
+            )
+        })
     }
 
     pub fn name(&self, show_line_col: bool) -> String {
-        let path = self.source_file.tree_relative_slashes();
-        let description = &self.change_description;
         if show_line_col {
-            format!(
-                "{path}:{}:{}: {description}",
-                self.span.start.line, self.span.start.column
-            )
+            self.full_name().to_owned()
         } else {
-            format!("{path}: {description}")
+            format!(
+                "{path}: {description}",
+                path = self.source_file.tree_relative_slashes(),
+                description = self.describe_change(),
+            )
         }
     }
 
@@ -298,6 +400,16 @@ impl Mutant {
             .to_string()
     }
 
+    /// Return the unified diff for the mutant, computing it at most once.
+    ///
+    /// `mutants.json` is written for every mutant before any of them is
+    /// tested, and the same diff is then written into the mutant's own output
+    /// directory when it is applied, so the diff of every tested mutant would
+    /// otherwise be computed twice.
+    pub fn cached_diff(&self) -> &str {
+        self.diff.get_or_init(|| self.diff(&self.mutated_code()))
+    }
+
     /// Apply this mutant to the relevant file within a `BuildDir`.
     pub fn apply(&self, build_dir: &BuildDir, mutated_code: &str) -> Result<()> {
         trace!(?self, "Apply mutant");
@@ -330,10 +442,9 @@ impl Mutant {
     /// This is used for both `--list --json` output and for writing `mutants.out/mutants.json`.
     pub fn to_json(&self) -> serde_json::Value {
         let mut obj = serde_json::to_value(self).expect("Serialize mutant");
-        obj.as_object_mut().unwrap().insert(
-            "diff".to_owned(),
-            serde_json::json!(self.diff(&self.mutated_code())),
-        );
+        obj.as_object_mut()
+            .unwrap()
+            .insert("diff".to_owned(), serde_json::json!(self.cached_diff()));
         obj
     }
 }
@@ -345,7 +456,7 @@ impl Serialize for Mutant {
     {
         // custom serialize to omit inessential info
         let mut ss = serializer.serialize_struct("Mutant", 7)?;
-        ss.serialize_field("name", &self.name)?;
+        ss.serialize_field("name", &self.full_name())?;
         ss.serialize_field("package", &self.source_file.package.name)?;
         ss.serialize_field("file", &self.source_file.tree_relative_slashes())?;
         ss.serialize_field("function", &self.function.as_ref().map(Arc::as_ref))?;
@@ -480,6 +591,9 @@ mod test {
             descriptions,
             [
                 "replace controlled_loop with ()",
+                "replace should_stop() with true in controlled_loop",
+                "replace start.elapsed() > Duration::from_secs(60 * 5) with true in controlled_loop",
+                "replace start.elapsed() > Duration::from_secs(60 * 5) with false in controlled_loop",
                 "replace > with == in controlled_loop",
                 "replace > with < in controlled_loop",
                 "replace > with >= in controlled_loop",

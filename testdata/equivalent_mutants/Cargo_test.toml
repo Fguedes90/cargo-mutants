@@ -1,0 +1,12 @@
+# A tree exercising `--detect-equivalent-mutants` (Trivial Compiler
+# Equivalence): it contains mutation sites that are reliably either
+# equivalent to the unmutated baseline, or redundant with a sibling mutant
+# of the same site, at the default (unoptimized, debug-assertions-off is not
+# required) build profile with `-Cdebuginfo=0`.
+#
+# See README.md for details of each case.
+[package]
+name = "cargo-mutants-testdata-equivalent-mutants"
+version = "0.1.0"
+edition = "2021"
+publish = false

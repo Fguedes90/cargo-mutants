@@ -1,0 +1,10 @@
+[package]
+name = "cargo-mutants-testdata-genres"
+description = "A tree exercising the if-condition, enum-variant, bool-literal, statement-deletion and return-value mutants"
+version = "0.0.0"
+edition = "2018"
+authors = ["Martin Pool"]
+publish = false
+
+[lib]
+doctest = false

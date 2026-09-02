@@ -132,11 +132,18 @@ impl Span {
     /// Resolve this span to a byte range within `s`.
     ///
     /// The end is clamped to the start so that a reversed or degenerate span
-    /// yields an empty range rather than panicking.
+    /// yields an empty range rather than panicking. Spans come from `syn`, so
+    /// a reversed one means a mutation genre built its span wrongly: that
+    /// would silently produce an empty or wrong mutation, so it is asserted in
+    /// debug builds while remaining safe in release.
     fn byte_range(&self, s: &str, line_index: &LineIndex) -> (usize, usize) {
         let start = line_index.byte_offset(s, self.start);
-        let end = line_index.byte_offset(s, self.end).max(start);
-        (start, end)
+        let end = line_index.byte_offset(s, self.end);
+        debug_assert!(
+            end >= start,
+            "reversed span {self:?} resolves to byte range {start}..{end}"
+        );
+        (start, end.max(start))
     }
 }
 
