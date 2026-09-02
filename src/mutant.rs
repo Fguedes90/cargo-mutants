@@ -55,6 +55,14 @@ pub struct Mutant {
     /// This is used in CLI output, filtering, and JSON.
     pub name: String,
 
+    /// The change this mutant makes, without the file location: the part of
+    /// `name` after the path.
+    ///
+    /// Precomputed because building it walks the styled parts of the mutant,
+    /// which is the expensive half of forming a name, and both `name` and
+    /// `name(false)` need exactly the same text.
+    change_description: String,
+
     /// Which file is being mutated.
     pub source_file: SourceFile,
 
@@ -125,6 +133,7 @@ impl Mutant {
     ) -> Self {
         let mut mutant = Mutant {
             name: String::new(),
+            change_description: String::new(),
             source_file,
             function,
             span,
@@ -133,6 +142,11 @@ impl Mutant {
             genre,
             target,
         };
+        mutant.change_description = mutant
+            .styled_parts()
+            .into_iter()
+            .map(|x| x.force_styling(false).to_string())
+            .collect();
         mutant.name = mutant.name(true);
         mutant
     }
@@ -150,29 +164,20 @@ impl Mutant {
     ///
     /// The result is like `replace factorial -> u32 with Default::default()`.
     pub fn describe_change(&self) -> String {
-        self.styled_parts()
-            .into_iter()
-            .map(|x| x.force_styling(false).to_string())
-            .collect::<String>()
+        self.change_description.clone()
     }
 
     pub fn name(&self, show_line_col: bool) -> String {
-        let mut v = Vec::new();
-        v.push(self.source_file.tree_relative_slashes());
+        let path = self.source_file.tree_relative_slashes();
+        let description = &self.change_description;
         if show_line_col {
-            v.push(format!(
-                ":{}:{}: ",
+            format!(
+                "{path}:{}:{}: {description}",
                 self.span.start.line, self.span.start.column
-            ));
+            )
         } else {
-            v.push(": ".to_owned());
+            format!("{path}: {description}")
         }
-        v.extend(
-            self.styled_parts()
-                .into_iter()
-                .map(|x| x.force_styling(false).to_string()),
-        );
-        v.join("")
     }
 
     /// Return a one-line description of this mutant, with coloring, including the file names
