@@ -276,10 +276,16 @@ impl OutputDir {
             .with_context(|| format!("open {debug_log_path}"))
     }
 
+    /// Write `mutants.json`, holding every mutant and its diff.
+    ///
+    /// Serialized straight into the file: the whole rendering is many times
+    /// the size of the source tree on a large one, so it is not worth
+    /// materialising as a string first.
     pub fn write_mutants_list(&self, mutants: &[Mutant]) -> Result<()> {
-        write(
-            self.path.join("mutants.json"),
-            crate::list::mutants_to_json_string(mutants),
+        let path = self.path.join("mutants.json");
+        serde_json::to_writer_pretty(
+            BufWriter::new(File::create(&path)?),
+            &crate::list::MutantsJson(mutants),
         )
         .context("write mutants.json")
     }

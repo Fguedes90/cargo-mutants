@@ -391,8 +391,7 @@ impl Worker<'_> {
 
         let mut outcome = ScenarioOutcome::new(&scenario_output, scenario.clone());
         if let Some(mutant) = scenario.mutant() {
-            // The diff was already computed when `mutants.json` was written.
-            scenario_output.write_diff(mutant.cached_diff())?;
+            scenario_output.write_diff(&mutant.diff())?;
             if let Some(message) = self.uncovered_message(mutant) {
                 debug!(mutant = mutant.full_name(), "uncovered mutant");
                 scenario_output.message(&message)?;

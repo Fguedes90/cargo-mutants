@@ -6,6 +6,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 use itertools::Itertools;
+use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 
 use crate::Options;
@@ -32,7 +33,7 @@ pub fn list_mutants(mutants: &[Mutant], options: &Options) -> String {
             }
             out.push('\n');
             if options.emit_diffs() {
-                out.push_str(mutant.cached_diff());
+                out.push_str(&mutant.diff());
                 out.push('\n');
             }
         }
@@ -63,11 +64,26 @@ pub fn list_files(source_files: &[SourceFile], options: &Options) -> String {
     }
 }
 
+/// A slice of mutants, serialized as the array that `--list --json` prints and
+/// that `mutants.out/mutants.json` contains.
+///
+/// Each mutant is turned into a [`serde_json::Value`] and serialized on its
+/// own, so only one mutant's JSON tree is alive at a time instead of the whole
+/// list. That `Value` step is also what sorts each mutant's keys, and the
+/// sorted order is part of the published format, so it can't be skipped in
+/// favour of serializing `Mutant` directly.
+pub struct MutantsJson<'a>(pub &'a [Mutant]);
+
+impl Serialize for MutantsJson<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(Mutant::to_json))
+    }
+}
+
 /// Convert a slice of mutants to a pretty-printed JSON string.
 ///
-/// Each mutant includes its diff. This is used for both `--list --json` output
-/// and for writing `mutants.out/mutants.json`.
+/// Each mutant includes its diff. Used for `--list --json`; `mutants.json` is
+/// written straight to the file instead, without going through a string.
 pub fn mutants_to_json_string(mutants: &[Mutant]) -> String {
-    let list: Vec<serde_json::Value> = mutants.iter().map(Mutant::to_json).collect();
-    serde_json::to_string_pretty(&list).expect("Serialize mutants")
+    serde_json::to_string_pretty(&MutantsJson(mutants)).expect("Serialize mutants")
 }

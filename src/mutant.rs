@@ -91,13 +91,6 @@ pub struct Mutant {
     /// `name(false)` need exactly the same text.
     change_description: OnceLock<String>,
 
-    /// The unified diff of this mutant against the original file.
-    ///
-    /// Cached because it is needed both when `mutants.json` is written, before
-    /// any mutant is tested, and again when the mutant is applied; computing
-    /// it diffs the whole file.
-    diff: OnceLock<String>,
-
     /// Which file is being mutated.
     pub source_file: SourceFile,
 
@@ -226,7 +219,6 @@ impl Mutant {
         Mutant {
             name: OnceLock::new(),
             change_description: OnceLock::new(),
-            diff: OnceLock::new(),
             source_file,
             function,
             span,
@@ -447,7 +439,12 @@ impl Mutant {
     ///
     /// The mutated side is built for the window alone, so the whole mutated
     /// file is never materialised just to be diffed.
-    fn diff(&self) -> String {
+    ///
+    /// Not cached: a run holds every mutant for its whole duration, so keeping
+    /// each diff would retain the entire rendering of the tree — tens of MB on
+    /// a large one — to save recomputing a few microseconds of work on the two
+    /// occasions a diff is needed.
+    pub fn diff(&self) -> String {
         let orig = self.source_file.code();
         let line_index = self.source_file.line_index();
         let (lo, hi) = self.span.byte_range(orig, line_index);
@@ -491,16 +488,6 @@ impl Mutant {
             .to_string()
     }
 
-    /// Return the unified diff for the mutant, computing it at most once.
-    ///
-    /// `mutants.json` is written for every mutant before any of them is
-    /// tested, and the same diff is then written into the mutant's own output
-    /// directory when it is applied, so the diff of every tested mutant would
-    /// otherwise be computed twice.
-    pub fn cached_diff(&self) -> &str {
-        self.diff.get_or_init(|| self.diff())
-    }
-
     /// Apply this mutant to the relevant file within a `BuildDir`.
     pub fn apply(&self, build_dir: &BuildDir, mutated_code: &str) -> Result<()> {
         trace!(?self, "Apply mutant");
@@ -535,7 +522,7 @@ impl Mutant {
         let mut obj = serde_json::to_value(self).expect("Serialize mutant");
         obj.as_object_mut()
             .unwrap()
-            .insert("diff".to_owned(), serde_json::json!(self.cached_diff()));
+            .insert("diff".to_owned(), serde_json::json!(self.diff()));
         obj
     }
 }
@@ -688,7 +675,7 @@ mod test {
             assert!(!mutants.is_empty(), "no mutants in {source:?}");
             for mutant in &mutants {
                 assert_eq!(
-                    mutant.cached_diff(),
+                    mutant.diff(),
                     whole_file_diff(mutant),
                     "windowed diff differs from whole-file diff for {}",
                     mutant.full_name()
