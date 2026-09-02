@@ -664,8 +664,7 @@ fn mutate_file(path: &Path, options: &Options) -> Result<()> {
     )
     .context("load source file")?
     .context("single source file is outside of tree??")?;
-    let error_exprs = options.parsed_error_exprs()?;
-    let (mutants, _mod_refs) = walk_file(&source_file, &error_exprs, options)?;
+    let (mutants, _mod_refs) = walk_file(&source_file, options)?;
     print!("{}", list_mutants(&mutants, options));
     Ok(())
 }

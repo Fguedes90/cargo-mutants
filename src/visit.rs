@@ -10,8 +10,10 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::needless_raw_string_hashes)]
 
-use std::collections::VecDeque;
+use std::num::NonZeroUsize;
+use std::panic::resume_unwind;
 use std::sync::Arc;
+use std::thread;
 use std::vec;
 
 use anyhow::anyhow;
@@ -68,11 +70,10 @@ pub fn walk_tree(
 ) -> Result<Discovered> {
     let mut mutants = Vec::new();
     let mut files = Vec::new();
-    let error_exprs = options.parsed_error_exprs()?;
     let progress = console.start_walk_tree();
     for package in packages {
         let (mut package_mutants, mut package_files) =
-            walk_package(workspace_dir, package, &error_exprs, &progress, options)?;
+            walk_package(workspace_dir, package, &progress, options)?;
         mutants.append(&mut package_mutants);
         files.append(&mut package_files);
     }
@@ -85,46 +86,94 @@ pub fn walk_tree(
 fn walk_package(
     workspace_dir: &Utf8Path,
     package: &Package,
-    error_exprs: &[Expr],
     progress: &WalkProgress,
     options: &Options,
 ) -> Result<(Vec<Mutant>, Vec<SourceFile>)> {
     let mut mutants = Vec::new();
     let mut files = Vec::new();
-    let mut filename_queue =
-        VecDeque::from_iter(package.top_sources.iter().map(|p| (p.to_owned(), true)));
-    while let Some((path, package_top)) = filename_queue.pop_front() {
-        let Some(source_file) = SourceFile::load(workspace_dir, &path, package, package_top)?
-        else {
-            info!("Skipping source file outside of tree: {path:?}");
-            continue;
-        };
-        progress.increment_files(1);
-        check_interrupted()?;
-        let (mut file_mutants, external_mods) = walk_file(&source_file, error_exprs, options)?;
-        progress.increment_mutants(file_mutants.len());
-        // TODO: It would be better not to spend time generating mutants from
-        // files that are not going to be visited later. However, we probably do
-        // still want to walk them to find modules that are referenced by them.
-        // since otherwise it could be pretty confusing that lower files are not
-        // visited.
-        //
-        // We'll still walk down through files that don't match globs, so that
-        // we have a chance to find modules underneath them. However, we won't
-        // collect any mutants from them, and they don't count as "seen" for
-        // `--list-files`.
-        for mod_namespace in &external_mods {
-            if let Some(mod_path) = find_mod_source(workspace_dir, &source_file, mod_namespace) {
-                filename_queue.push_back((mod_path, false));
+    // Files whose `mod` statements have not been followed yet. Handled one
+    // breadth-first level at a time so that the files in a level can be walked
+    // concurrently while preserving the discovery order a serial walk produces.
+    let mut pending: Vec<(Utf8PathBuf, bool)> = package
+        .top_sources
+        .iter()
+        .map(|p| (p.to_owned(), true))
+        .collect();
+    while !pending.is_empty() {
+        let mut level = Vec::with_capacity(pending.len());
+        for (path, package_top) in pending.drain(..) {
+            if let Some(source_file) =
+                SourceFile::load(workspace_dir, &path, package, package_top)?
+            {
+                level.push(source_file);
+            } else {
+                info!("Skipping source file outside of tree: {path:?}");
             }
         }
-        if !options.allows_source_file_path(&source_file.tree_relative_path) {
-            continue;
+        if level.is_empty() {
+            break;
         }
-        mutants.append(&mut file_mutants);
-        files.push(source_file);
+        progress.increment_files(level.len());
+        check_interrupted()?;
+        let walked = walk_files(&level, options)?;
+        for (source_file, (mut file_mutants, external_mods)) in level.into_iter().zip(walked) {
+            progress.increment_mutants(file_mutants.len());
+            // TODO: It would be better not to spend time generating mutants from
+            // files that are not going to be visited later. However, we probably do
+            // still want to walk them to find modules that are referenced by them.
+            // since otherwise it could be pretty confusing that lower files are not
+            // visited.
+            //
+            // We'll still walk down through files that don't match globs, so that
+            // we have a chance to find modules underneath them. However, we won't
+            // collect any mutants from them, and they don't count as "seen" for
+            // `--list-files`.
+            for mod_namespace in &external_mods {
+                if let Some(mod_path) = find_mod_source(workspace_dir, &source_file, mod_namespace)
+                {
+                    pending.push((mod_path, false));
+                }
+            }
+            if !options.allows_source_file_path(&source_file.tree_relative_path) {
+                continue;
+            }
+            mutants.append(&mut file_mutants);
+            files.push(source_file);
+        }
     }
     Ok((mutants, files))
+}
+
+/// Walk a set of files, each on its own thread, returning results in input order.
+///
+/// Each file gets a fresh thread for two reasons. `proc_macro2`'s source map,
+/// which backs every span lookup, is a thread-local that gains an entry per file
+/// parsed and is scanned linearly on each lookup, so walking a whole tree on one
+/// thread costs O(mutants x files); a thread per file keeps exactly one file in
+/// the map. Running those threads concurrently then also uses the cores that
+/// would otherwise sit idle throughout discovery.
+fn walk_files(
+    source_files: &[SourceFile],
+    options: &Options,
+) -> Result<Vec<(Vec<Mutant>, Vec<ExternalModRef>)>> {
+    let concurrency = thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    let mut results = Vec::with_capacity(source_files.len());
+    for chunk in source_files.chunks(concurrency) {
+        let walked = thread::scope(|scope| {
+            let handles = chunk
+                .iter()
+                .map(|source_file| scope.spawn(move || walk_file(source_file, options)))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap_or_else(|payload| resume_unwind(payload)))
+                .collect::<Vec<_>>()
+        });
+        for result in walked {
+            results.push(result?);
+        }
+    }
+    Ok(results)
 }
 
 /// Find all possible mutants in a source file.
@@ -133,15 +182,17 @@ fn walk_package(
 /// that should be visited later.
 pub fn walk_file(
     source_file: &SourceFile,
-    error_exprs: &[Expr],
     options: &Options,
 ) -> Result<(Vec<Mutant>, Vec<ExternalModRef>)> {
     let _span = debug_span!("source_file", path = source_file.tree_relative_slashes()).entered();
     trace!("visit source file");
+    // Parsed here rather than passed in: `syn::Expr` is not `Send`, and this
+    // function runs on a per-file thread.
+    let error_exprs = options.parsed_error_exprs()?;
     let syn_file = syn::parse_str::<syn::File>(source_file.code())
         .with_context(|| format!("failed to parse {}", source_file.tree_relative_slashes()))?;
     let mut visitor = DiscoveryVisitor {
-        error_exprs,
+        error_exprs: &error_exprs,
         error: None,
         exclude_re_stack: Vec::new(),
         external_mods: Vec::new(),
@@ -170,7 +221,7 @@ pub fn mutate_source_str(code: &str, options: &Options) -> Result<Vec<Mutant>> {
         "cargo-mutants-testdata-internal",
         true,
     );
-    let (mutants, _) = walk_file(&source_file, &options.parsed_error_exprs()?, options)?;
+    let (mutants, _) = walk_file(&source_file, options)?;
     Ok(mutants)
 }
 
@@ -187,10 +238,7 @@ pub fn mutate_expr(code: &str) -> Vec<String> {
         "cargo-mutants-testdata-internal",
         true,
     );
-    let error_exprs = options
-        .parsed_error_exprs()
-        .expect("failed to parse error exprs");
-    match walk_file(&source_file, &error_exprs, &options) {
+    match walk_file(&source_file, &options) {
         Ok((mutants, _)) => mutants
             .iter()
             .filter(|m| !m.name(false).ends_with("replace test_harness with ()"))
@@ -1353,7 +1401,7 @@ mod test {
         "};
         let source_file = SourceFile::for_tests("src/lib.rs", code, "unimportant", true);
         let (mutants, _files) =
-            walk_file(&source_file, &[], &Options::default()).expect("walk_file");
+            walk_file(&source_file, &Options::default()).expect("walk_file");
         let mutant_names = mutants.iter().map(|m| m.name(false)).collect_vec();
         // It would be good to suggest replacing this with 'false', breaking a key behavior,
         // but bad to replace it with 'true', changing nothing.
