@@ -263,6 +263,29 @@ plus a whole-file write to apply each mutant and another to revert it — sits
 inside that ~1.5 ms. It is recorded here as measured and rejected, not as a
 lead.
 
+### Skipping mutant construction for glob-excluded files: measured and rejected
+
+`walk_package` builds every file's mutants and only then drops the ones the
+`-f`/`--exclude` globs exclude, with a standing TODO saying it would be better
+not to build them at all. It was implemented — a `collect_mutants` flag on the
+visitor, so an excluded file is still parsed and walked (its `mod` statements
+still have to be followed) but produces no `Mutant` — and it bought nothing:
+
+| Workload | Before | After |
+|---|---|---|
+| `--list -f src/s5.rs` on the 100-file fixture (10 of 2,000 mutants kept) | 30.9 ms, 17.45 MB | 35.8 ms, 17.50 MB |
+| `--list -f src/span.rs` on this crate's own tree (42 mutants kept) | 38.3 ms | 38.1 ms |
+
+The premise was stale. Discarding 1,990 of 2,000 mutants costs 1.1 ms on that
+fixture, because the passes above made a `Mutant` a 288-byte struct with no
+eagerly built description and no cached diff. What a filtered run actually pays
+for is parsing every file, which the change cannot avoid. The TODO is left in
+place and this row records why it should not be picked up again without first
+re-measuring the gap it claims.
+
+The benchmark keeps the filtered workload and its mutant-count gate, since that
+is the measurement that settled it.
+
 ### Measurement discipline, again
 
 The many-small-files workload has a broad, right-skewed wall-time distribution

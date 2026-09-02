@@ -179,6 +179,8 @@ EXPECT_DIFF_SHA = {"w1_mixed": "32a7997e11a31a86",
 # Same, for the `--list --json` rendering that `mutants.json` uses.
 EXPECT_JSON_SHA = {"w1_mixed": "ad96543fdb4352b7",
                    "w2_bigfile": "baea50505f3d2f11"}
+# A filtered run reports only the mutants of the file the glob selects.
+EXPECT_FILTERED = 10
 # 21 reps, not a handful: the many-small-files workload spawns one thread per
 # file, and its wall time is broad and right-skewed (measured spread ~37-46 ms
 # for one fixed binary). A min-of-5 on that distribution does not converge and
@@ -290,6 +292,26 @@ REPS = saved_reps
 print(f"  {'json_bigfile':14s} min={results['json_bigfile_ms']:8.1f} ms  "
       f"median={medians['json_bigfile_ms']:8.1f} ms")
 
+# A filtered run: the workflow of iterating on one file in a large tree.
+# Every file is still parsed, because `mod` statements have to be followed,
+# but the mutants of excluded files are discarded, so building them is waste.
+# Measured on the many-small-files fixture, where the ratio of discarded to
+# kept mutants is highest.
+filtered = ["--list", "-f", "src/s5.rs"]
+nbytes, out = peak_bytes(
+    [BIN, "mutants"] + filtered + ["-d", os.path.join(FIX, "w3_manyfiles")])
+peaks["filtered_manyfiles"] = nbytes / 1e6
+filtered_count = len([l for l in out.splitlines() if l.strip()])
+saved_reps = REPS
+REPS = 9
+results["filtered_ms"], medians["filtered_ms"], _ = timed(
+    [BIN, "mutants"] + filtered + ["-d", os.path.join(FIX, "w3_manyfiles")])
+REPS = saved_reps
+print(f"  {'filtered':14s} min={results['filtered_ms']:8.1f} ms  "
+      f"median={medians['filtered_ms']:8.1f} ms  "
+      f"peak={peaks['filtered_manyfiles']:6.1f} MB  "
+      f"mutants={filtered_count}")
+
 # End-to-end. --jobs 1 keeps scheduling deterministic.
 e2e_dir = os.path.join(FIX, "w4_e2e")
 t = time.perf_counter()
@@ -317,6 +339,11 @@ for name, want in EXPECT_MUTANTS.items():
 for k, want in EXPECT_E2E.items():
     if got_e2e[k] != want:
         errs.append(f"w4_e2e {k}: expected {want}, got {got_e2e[k]}")
+# Skipping the mutants of excluded files must not change which mutants a
+# filtered run reports.
+if filtered_count != EXPECT_FILTERED:
+    errs.append(f"filtered run: expected {EXPECT_FILTERED} mutants, "
+                f"got {filtered_count}")
 # The unified diffs must stay byte-identical. This is the gate that makes it
 # safe to optimise diff generation: any change to a single byte of any of the
 # 9,640 diffs across these two fixtures fails the run.
@@ -372,9 +399,13 @@ print("METRIC own_ms=%.1f" % (discovery_total + diff_total
                               + results["json_bigfile_ms"]))
 print("METRIC discovery_total_ms=%.1f" % discovery_total)
 print("METRIC diff_total_ms=%.1f" % diff_total)
-print("METRIC total_median_ms=%.1f" % sum(medians.values()))
+# Summed over an explicit list, so that adding a workload later doesn't
+# silently redefine this metric and break comparability with earlier runs.
+print("METRIC total_median_ms=%.1f" % sum(
+    medians[k] for k in ("list_mixed_ms", "list_bigfile_ms", "list_manyfiles_ms",
+                         "diff_mixed_ms", "diff_bigfile_ms", "json_bigfile_ms")))
 for k in ("list_mixed_ms", "list_bigfile_ms", "list_manyfiles_ms",
-          "diff_mixed_ms", "diff_bigfile_ms", "json_bigfile_ms"):
+          "diff_mixed_ms", "diff_bigfile_ms", "json_bigfile_ms", "filtered_ms"):
     print("METRIC %s=%.1f" % (k, results[k]))
 print("METRIC e2e_ms=%.1f" % e2e_ms)
 print("METRIC cargo_spawns=%d" % spawns)
