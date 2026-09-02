@@ -40,6 +40,14 @@
   took 4.5 s, and now takes 0.11 s. The generated diffs are byte-for-byte
   unchanged.
 
+- Performance: cargo-mutants uses much less memory to list mutants and to
+  write `mutants.out/mutants.json`. The mutant list is now serialized straight
+  to its destination one mutant at a time, instead of building the whole
+  rendering — several times the size of the source tree — as a string first,
+  and mutants no longer each retain their own diff for the lifetime of the run.
+  Listing a 300 KB file with 7,600 mutants as JSON went from 140 MB peak to
+  34 MB. Output is byte-for-byte unchanged.
+
 ## 27.1.0
 
 Released 2026-06-02.

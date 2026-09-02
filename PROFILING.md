@@ -192,6 +192,77 @@ off-by-one in either window boundary, or dropping the renumbering, fails it.
 After this, the large-file fixture's profile collapsed from 44,875 samples to
 132, and `--list --diff` on it is no longer dominated by anything of ours.
 
+### Memory: the output was being built twice over
+
+Time is not the only cost. Listing a 300 KB file with 7,600 mutants as JSON
+peaked at **140 MB**, against 36 MB for the same tree without `--json`:
+
+| Change | Mechanism | Peak |
+|---|---|---|
+| Baseline | | 140 MB |
+| Serialize one mutant at a time; stop caching diffs | `mutants_to_json_string` collected a `serde_json::Value` for *every* mutant — each copying that mutant's cached diff into the DOM — and only then rendered the list. A `MutantsJson` wrapper now `collect_seq`s over the same per-mutant `Value`s, so one is alive at a time, and `mutants.json` is written with `to_writer_pretty` straight into the file. `Mutant` also no longer holds its diff in a `OnceLock`. | 51 MB |
+| Stream the list to stdout | `list_mutants` returned a `String` that `main` printed, so the full 17.7 MB rendering was materialised, and `serde` grows that buffer by doubling. `write_mutants` now takes an `impl Write`. | 34 MB |
+
+Note what the middle row does *not* do: serialize `Mutant` directly. Its keys
+come out sorted only because they pass through a `serde_json::Value`, whose map
+is a `BTreeMap`, while the `Serialize` impl declares them in a different order
+— and `outcomes.json` streams the shared `Span`/`LineColumn` impls in
+declaration order. Skipping the `Value` would silently reorder `mutants.json`.
+The per-mutant `Value` is therefore deliberate, and both formats are pinned by
+SHA in the benchmark.
+
+Dropping the diff cache is only correct *because* of the windowing change
+above. Retaining every diff bought avoiding a 4.5 s recomputation; it now buys
+avoiding 7.7 µs, while holding the whole tree's rendering in memory for the
+life of the run.
+
+### Where the remaining memory goes, and why it is not ours
+
+Scaling experiments on generated trees, separating the three terms rather than
+letting them move together:
+
+| Term | Cost |
+|---|---|
+| Empty process | 2.4 MB |
+| Each parsed function | **~12.5 KB** |
+| Each mutant | 771 bytes |
+| Each byte of source | negligible — padding a file from 51 KB to 651 KB of comments moved peak by 1.3 MB |
+
+The dominant term is `syn`'s AST, by a factor of 16 over our own per-mutant
+data: a 278 KB file costs 52 MB to parse *with every function skipped, so with
+zero mutants*. A function whose source is 68 bytes costs ~12.5 KB of AST. That
+is the parser's shape, not something cargo-mutants can restructure, and it is
+multiplied by the number of files walked concurrently — the same per-file
+threading that made discovery 12x faster. Reducing it would mean giving that
+back.
+
+Our own 771 bytes per mutant is a 288-byte `Mutant` plus the slack of the
+growing `Vec` and about five small strings. Everything shareable is already
+behind an `Arc` (`Package`, the source text, the `LineIndex`). Boxing the
+48-byte `Option<MutationTarget>`, or the rejected `Arc<SourceFile>`, would
+together save maybe 1-2 MB of the 33 MB — under 5%, for a structural change to
+the core type and, in the `Arc` case, a measured time regression.
+
+### The run loop was measured and left alone
+
+`e2e_ms` is rustc-dominated and ±5%, so it cannot resolve per-scenario
+overhead. Driving a full 2,040-mutant run with a no-op `$CARGO` shim (which is
+honoured, so the loop runs with rustc removed) took 16.18 s against a measured
+13.11 s floor for the same 4,080 bare `fork`/`exec` calls. That leaves **~1.5 ms
+per mutant** of our own code, and its profile is ~68% `libsystem_kernel`
+spawn/wait with nothing algorithmic above it. Against seconds of rustc per real
+mutant that is around 0.05%.
+
+`outcomes.json`, which is rewritten from the whole accumulated `LabOutcome`
+after every scenario and would otherwise be O(N²) in bytes, is already
+throttled to one rewrite per 500 ms.
+
+The one item in the loop that is genuinely ours and looked worth a second
+glance — `start_scenario` doing file I/O under a single run-wide output mutex,
+plus a whole-file write to apply each mutant and another to revert it — sits
+inside that ~1.5 ms. It is recorded here as measured and rejected, not as a
+lead.
+
 ### Measurement discipline, again
 
 The many-small-files workload has a broad, right-skewed wall-time distribution
