@@ -28,7 +28,7 @@ pub fn list_mutants(mutants: &[Mutant], options: &Options) -> String {
             if colors {
                 out.push_str(&mutant.to_styled_string(options.show_line_col));
             } else {
-                out.push_str(&mutant.name(options.show_line_col));
+                mutant.write_name(options.show_line_col, &mut out);
             }
             out.push('\n');
             if options.emit_diffs() {

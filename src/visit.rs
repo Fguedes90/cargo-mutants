@@ -594,10 +594,17 @@ impl DiscoveryVisitor<'_> {
         }
     }
 
-    /// Check whether a mutant name is excluded by any of the currently-active
-    /// `#[mutants::exclude_re("...")]` attributes on the stack.
-    fn excluded_by_attr_re(&self, name: &str) -> bool {
-        self.exclude_re_stack.iter().any(|re| re.is_match(name))
+    /// Whether any currently-active `#[mutants::exclude_re("...")]` attribute
+    /// rejects this mutant by name.
+    ///
+    /// The mutant's name is built only when some attribute is actually in
+    /// scope, which is not the common case: with an empty stack the answer is
+    /// `false` whatever the name is.
+    fn excluded_by_attr_re(&self, mutant: &Mutant) -> bool {
+        !self.exclude_re_stack.is_empty() && {
+            let name = mutant.full_name();
+            self.exclude_re_stack.iter().any(|re| re.is_match(name))
+        }
     }
 
     /// Record that we generated some mutants.
@@ -618,7 +625,7 @@ impl DiscoveryVisitor<'_> {
             None,
             self.const_eval_depth > 0,
         );
-        if self.excluded_by_attr_re(mutant.full_name()) {
+        if self.excluded_by_attr_re(&mutant) {
             trace!(
                 name = mutant.name(false),
                 "skip mutant by exclude_re attribute"
@@ -1328,7 +1335,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                             }),
                             v.const_eval_depth > 0,
                         );
-                        if !v.excluded_by_attr_re(mutant.full_name()) {
+                        if !v.excluded_by_attr_re(&mutant) {
                             v.mutants.push(mutant);
                         }
                     }

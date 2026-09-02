@@ -57,6 +57,18 @@ pub enum MutationTarget {
     },
 }
 
+/// How one part of a mutant's description is coloured.
+///
+/// See [`Mutant::describe_parts`].
+#[derive(Clone, Copy)]
+enum PartStyle {
+    Plain,
+    Yellow,
+    BrightYellow,
+    Magenta,
+    BrightMagenta,
+}
+
 /// A mutation applied to source code.
 #[derive(Clone)]
 pub struct Mutant {
@@ -247,10 +259,9 @@ impl Mutant {
     /// The result is like `replace factorial -> u32 with Default::default()`.
     pub fn describe_change(&self) -> &str {
         self.change_description.get_or_init(|| {
-            self.styled_parts()
-                .into_iter()
-                .map(|x| x.force_styling(false).to_string())
-                .collect()
+            let mut out = String::new();
+            self.describe_parts(&mut |_style, text| out.push_str(text));
+            out
         })
     }
 
@@ -270,16 +281,25 @@ impl Mutant {
         })
     }
 
-    pub fn name(&self, show_line_col: bool) -> String {
+    /// Append the name of this mutant to `out`.
+    ///
+    /// Equivalent to `out.push_str(&self.name(show_line_col))` but without
+    /// allocating the name first, which `--list` would otherwise do once per
+    /// mutant.
+    pub fn write_name(&self, show_line_col: bool, out: &mut String) {
         if show_line_col {
-            self.full_name().to_owned()
+            out.push_str(self.full_name());
         } else {
-            format!(
-                "{path}: {description}",
-                path = self.source_file.tree_relative_slashes(),
-                description = self.describe_change(),
-            )
+            out.push_str(self.source_file.tree_relative_slashes());
+            out.push_str(": ");
+            out.push_str(self.describe_change());
         }
+    }
+
+    pub fn name(&self, show_line_col: bool) -> String {
+        let mut out = String::new();
+        self.write_name(show_line_col, &mut out);
+        out
     }
 
     /// Return a one-line description of this mutant, with coloring, including the file names
@@ -297,44 +317,45 @@ impl Mutant {
         v.join("")
     }
 
-    fn styled_parts(&self) -> Vec<StyledObject<String>> {
-        // This is like `impl Display for Mutant`, but with colors.
-        // The text content should be the same.
-        #[allow(clippy::needless_pass_by_value)] // actually is needed for String vs &str?
-        fn s<S: ToString>(s: S) -> StyledObject<String> {
-            style(s.to_string())
-        }
-        let mut v: Vec<StyledObject<String>> = Vec::new();
+    /// Emit the parts of this mutant's description, in order, to `f`.
+    ///
+    /// This is the single definition of the description text; the plain
+    /// rendering concatenates the parts and the coloured rendering styles them
+    /// according to [`PartStyle`], so the two cannot drift apart. Parts are
+    /// passed as `&str` so that the plain rendering, which is the common case
+    /// and is built for every mutant, allocates only its output string.
+    fn describe_parts(&self, f: &mut impl FnMut(PartStyle, &str)) {
         match self.genre {
             Genre::FnValue => {
-                v.push(s("replace "));
+                f(PartStyle::Plain, "replace ");
                 let function = self
                     .function
                     .as_ref()
                     .expect("FnValue mutant should have a function");
-                v.push(s(&function.function_name).bright().magenta());
+                f(PartStyle::BrightMagenta, &function.function_name);
                 if !function.return_type.is_empty() {
-                    v.push(s(" "));
-                    v.push(s(&function.return_type).magenta());
+                    f(PartStyle::Plain, " ");
+                    f(PartStyle::Magenta, &function.return_type);
                 }
-                v.push(s(" with "));
-                v.push(s(self.replacement_text()).yellow());
+                f(PartStyle::Plain, " with ");
+                f(PartStyle::Yellow, self.replacement_text());
             }
             Genre::MatchArmGuard => {
-                v.push(s("replace match guard "));
-                v.push(s(squash_lines(self.original_text().as_ref())).yellow());
-                v.push(s(" with "));
-                v.push(s(self.replacement_text()).yellow());
+                f(PartStyle::Plain, "replace match guard ");
+                let original = self.original_text();
+                f(PartStyle::Yellow, &squash_lines(&original));
+                f(PartStyle::Plain, " with ");
+                f(PartStyle::Yellow, self.replacement_text());
             }
             Genre::MatchArm => {
-                v.push(s("delete match arm "));
-                v.push(
-                    s(squash_lines(
+                f(PartStyle::Plain, "delete match arm ");
+                f(
+                    PartStyle::Yellow,
+                    &squash_lines(
                         self.short_replaced
                             .as_ref()
                             .expect("short_replaced should be set on MatchArm"),
-                    ))
-                    .yellow(),
+                    ),
                 );
             }
             Genre::StructField => {
@@ -343,35 +364,51 @@ impl Mutant {
                     struct_name,
                 }) = &self.target
                 {
-                    v.push(s("delete field "));
-                    v.push(s(field_name).yellow());
-                    v.push(s(" from struct "));
-                    v.push(s(struct_name).yellow());
-                    v.push(s(" expression"));
+                    f(PartStyle::Plain, "delete field ");
+                    f(PartStyle::Yellow, field_name);
+                    f(PartStyle::Plain, " from struct ");
+                    f(PartStyle::Yellow, struct_name);
+                    f(PartStyle::Plain, " expression");
                 } else {
                     // Fallback: shouldn't happen with proper initialization
-                    v.push(s("delete field from struct expression"));
+                    f(PartStyle::Plain, "delete field from struct expression");
                 }
             }
             _ => {
                 if self.replacement.is_empty() {
-                    v.push(s("delete "));
+                    f(PartStyle::Plain, "delete ");
                 } else {
-                    v.push(s("replace "));
+                    f(PartStyle::Plain, "replace ");
                 }
-                v.push(s(self.original_text()).yellow());
+                f(PartStyle::Yellow, &self.original_text());
                 if !self.replacement.is_empty() {
-                    v.push(s(" with "));
-                    v.push(s(&self.replacement).bright().yellow());
+                    f(PartStyle::Plain, " with ");
+                    f(PartStyle::BrightYellow, &self.replacement);
                 }
             }
         }
         if !matches!(self.genre, Genre::FnValue)
             && let Some(func) = &self.function
         {
-            v.push(s(" in "));
-            v.push(s(&func.function_name).bright().magenta());
+            f(PartStyle::Plain, " in ");
+            f(PartStyle::BrightMagenta, &func.function_name);
         }
+    }
+
+    fn styled_parts(&self) -> Vec<StyledObject<String>> {
+        // This is like `impl Display for Mutant`, but with colors.
+        // The text content is the same: see `describe_parts`.
+        let mut v: Vec<StyledObject<String>> = Vec::new();
+        self.describe_parts(&mut |part_style, text| {
+            let styled = style(text.to_owned());
+            v.push(match part_style {
+                PartStyle::Plain => styled,
+                PartStyle::Yellow => styled.yellow(),
+                PartStyle::BrightYellow => styled.bright().yellow(),
+                PartStyle::Magenta => styled.magenta(),
+                PartStyle::BrightMagenta => styled.bright().magenta(),
+            });
+        });
         v
     }
 
