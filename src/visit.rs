@@ -340,8 +340,8 @@ struct DiscoveryVisitor<'o> {
 
     /// Stack of compiled `RegexSet`s from `#[mutants::exclude_re("...")]` attributes.
     ///
-    /// Each entry corresponds to a scope (file, mod, impl, trait, fn).
-    /// When collecting a mutant, all entries in the stack are checked.
+    /// Only scopes that actually carry patterns are pushed, so this is usually
+    /// empty. When collecting a mutant, all entries in the stack are checked.
     exclude_re_stack: Vec<RegexSet>,
 
     /// If set, an error occurred during visiting (e.g. invalid regex in an attribute).
@@ -349,6 +349,16 @@ struct DiscoveryVisitor<'o> {
     /// Since `Visit` trait methods cannot return errors, we store the error here
     /// and propagate it after the visitor finishes.
     error: Option<anyhow::Error>,
+}
+
+/// Whether entering a scope pushed an `exclude_re` entry that must be popped.
+enum ExcludeScope {
+    /// Patterns were compiled and pushed; the caller must pop them.
+    Pushed,
+    /// The scope has no `exclude_re` patterns, so nothing was pushed.
+    Empty,
+    /// An error was stored on the visitor; children must not be visited.
+    Error,
 }
 
 impl DiscoveryVisitor<'_> {
@@ -382,14 +392,15 @@ impl DiscoveryVisitor<'_> {
 
     /// Push `#[mutants::exclude_re("...")]` patterns from the given attributes onto the stack.
     ///
-    /// Returns `true` if successful, `false` if an error was stored on the
-    /// visitor (invalid regex or malformed attribute). On error the caller
-    /// must not visit children and must not call [`Self::pop_exclude_re`],
-    /// because nothing was pushed.
+    /// Most items carry no `exclude_re` attribute, so the common result is
+    /// [`ExcludeScope::Empty`]: nothing is pushed and nothing must be popped.
+    /// Pushing an empty `RegexSet` instead would build a whole regex automaton
+    /// per visited item, and leave dead entries for `excluded_by_attr_re` to
+    /// scan for every mutant.
     ///
     /// Prefer [`Self::in_exclude_re_scope`] over calling push/pop directly so
     /// that early returns can't leave the stack unbalanced.
-    fn push_exclude_re(&mut self, attrs: &[Attribute]) -> bool {
+    fn push_exclude_re(&mut self, attrs: &[Attribute]) -> ExcludeScope {
         let patterns = match attrs_exclude_re_patterns(attrs) {
             Ok(patterns) => patterns,
             Err((span, msg)) => {
@@ -398,17 +409,16 @@ impl DiscoveryVisitor<'_> {
                     .format_source_location(LineColumn::from(span.start()));
                 self.error
                     .get_or_insert_with(|| anyhow!("{location}: {msg}"));
-                return false;
+                return ExcludeScope::Error;
             }
         };
         if patterns.is_empty() {
-            self.exclude_re_stack.push(RegexSet::empty());
-            return true;
+            return ExcludeScope::Empty;
         }
         match RegexSet::new(&patterns) {
             Ok(re) => {
                 self.exclude_re_stack.push(re);
-                true
+                ExcludeScope::Pushed
             }
             Err(err) => {
                 let location = attrs
@@ -432,7 +442,7 @@ impl DiscoveryVisitor<'_> {
                 self.error.get_or_insert_with(|| {
                     anyhow!("{location}: invalid regex in #[mutants::exclude_re({quoted})]: {err}")
                 });
-                false
+                ExcludeScope::Error
             }
         }
     }
@@ -458,11 +468,17 @@ impl DiscoveryVisitor<'_> {
     where
         F: FnOnce(&mut Self),
     {
-        if !self.push_exclude_re(attrs) {
+        // `f` is called from exactly one place on purpose: it carries the whole
+        // body of a `visit_*` method, so a second call site would duplicate
+        // that code into every caller.
+        let scope = self.push_exclude_re(attrs);
+        if matches!(scope, ExcludeScope::Error) {
             return;
         }
         f(self);
-        self.pop_exclude_re();
+        if matches!(scope, ExcludeScope::Pushed) {
+            self.pop_exclude_re();
+        }
     }
 
     /// Check whether a mutant name is excluded by any of the currently-active
