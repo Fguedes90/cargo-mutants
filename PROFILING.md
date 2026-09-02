@@ -11,7 +11,7 @@ architecture and CONTRIBUTING.md for process.
 | Date | 2026-09-01 |
 | Version / commit | 27.1.0 / `fe82f18` |
 | Host | Apple M4 Pro, 12 cores, macOS (darwin 25.4.0), APFS |
-| Toolchain | cargo 1.98.0 |
+| Toolchain | cargo 1.98.0. `cargo-nextest` is **not** installed on this machine |
 | Binary | `target/release/cargo-mutants`, built with `CARGO_PROFILE_RELEASE_DEBUG=true` for symbolication |
 
 Tooling: `samply` for CPU sampling, `atos` for symbol resolution (samply's saved
@@ -19,28 +19,42 @@ profile stores unsymbolicated addresses), a `$CARGO` shim script to count and
 identify subprocess invocations, and controlled scaling experiments on generated
 trees. `dtrace` was unavailable (requires sudo).
 
-Two measurement targets were used deliberately, because they exercise different
+### Measurement discipline
+
+**All timings below were taken on an idle machine and are min-of-N repetitions.**
+This matters: an initial pass of this profiling produced wall-clock numbers
+inflated by roughly 5x because the measurements overlapped a full release
+rebuild saturating all 12 cores (15-minute load average 53). Those numbers were
+wrong and have been replaced. Every absolute figure here has been re-taken with
+the machine quiet and the load average verified beforehand.
+
+The *shape* results — the quadratic scaling exponent and the CPU attribution
+percentages — survived the correction; only the absolute magnitudes changed.
+Ratios and profile proportions are inherently more robust to background load
+than wall-clock absolutes are.
+
+Two measurement targets are used deliberately, because they exercise different
 hot paths:
 
 - **the cargo-mutants tree itself** — 54 source files, 466 KB, 776 mutants,
   1.70 mutants/KB. Representative of a normal project.
 - **generated single-file trees** — up to 914 KB in one file, ~25 mutants/KB.
   Exercises per-file scaling. The mutant density is ~15x higher than real code,
-  so absolute times here are pessimistic; the *scaling exponent* is the result
-  that matters, not the constant.
+  so absolute times there are pessimistic; the *scaling exponent* is the result
+  that transfers, not the constant.
 
 ## Summary
 
 | # | Bottleneck | Where | Evidence | Impact |
 |---|---|---|---|---|
-| 1 | `Span::extract` is O(file) per mutant candidate → discovery is O(n²) | `span.rs:68`, `mutant.rs:272` | 93.1% of CPU; 4x time per 2x size across 4 doublings | Critical on large files |
-| 2 | Dropping the `syn` AST | `visit.rs` (via `syn`) | 36.7% of CPU on a normal tree | High |
-| 3 | `outcomes.json` fully rewritten per mutant → O(N²) write volume | `output.rs:200-211` | 1543 B/outcome measured; ~465 MB written per 776-mutant run | High |
-| 4 | Redundant second `cargo locate-project` | `workspace.rs:137` | 3 cargo spawns per run; ~140 ms each | ~26% of `--list` |
-| 5 | 50 ms fixed subprocess poll interval | `process.rs:27,63` | ~25 ms mean latency per phase | ~39 s per 776-mutant run |
-| 6 | Integration tests run full mutation runs where `--list`/`--check` would do | `tests/main.rs` | 924 CPU-s total; 126 s in 7 assert-only tests | ~100 s recoverable |
+| 1 | `Span::extract` is O(file) per mutant candidate → discovery is O(n²) | `span.rs:68`, `mutant.rs:272` | 88.4% of CPU on a large file; ~4x time per 2x size across 4 doublings | Critical on large files |
+| 2 | 50 ms fixed subprocess poll interval | `process.rs:27,63` | ~25 ms mean dead time per scenario-phase | ~39 CPU-idle seconds per 776-mutant run |
+| 3 | `outcomes.json` fully rewritten per mutant → O(N²) write volume | `output.rs:200-211` | 1543 B/outcome measured; ~465 MB written per 776-mutant run | High at scale |
+| 4 | `syn` AST teardown | `visit.rs`, via `syn` | ~18% of CPU on a normal tree, spread across drop glue | Moderate |
+| 5 | Redundant second `cargo locate-project` | `workspace.rs:137` | 3 cargo spawns per run, ~15 ms each | ~15% of `--list` |
+| 6 | Integration tests run full mutation runs where `--list`/`--check` would do | `tests/main.rs` | 7 tests assert only `.success()`, verified in source | Developer time |
 
-Recommended order of attack by return on effort: **1 → 3 → 2 → 4 → 6 → 5**.
+Recommended order of attack by return on effort: **1 → 3 → 2 → 4 → 5 → 6**.
 
 ---
 
@@ -48,27 +62,28 @@ Recommended order of attack by return on effort: **1 → 3 → 2 → 4 → 6 →
 
 **Severity: critical.** Discovery time grows as the square of source file size.
 
-Measured on generated single-file trees, subtracting the ~400 ms fixed cargo
-subprocess cost to isolate cargo-mutants' own work:
+Measured on generated single-file trees, idle machine, min of 3 runs, with the
+cargo metadata/lockfile warmed beforehand so startup cost is not counted as
+variable:
 
-| file size | mutants | own time | factor vs previous |
+| file size | mutants | min time | factor vs previous |
 |---|---|---|---|
-| 114 KB | 2 850 | 1.23 s | — |
-| 228 KB | 5 700 | 4.76 s | x3.88 |
-| 457 KB | 11 400 | 21.07 s | x4.43 |
-| 914 KB | 22 800 | 80.74 s | x3.83 |
+| 114 KB | 2 850 | 267.6 ms | — |
+| 228 KB | 5 700 | 858.7 ms | x3.21 |
+| 457 KB | 11 400 | 3 205.4 ms | x3.73 |
+| 914 KB | 22 800 | 12 427.0 ms | x3.88 |
 
-Approximately 4x per doubling across four consecutive doublings is O(n²). A
-914 KB file takes **81 seconds merely to `--list` mutants**, with no compilation
-involved.
+The ratio converges on 4x per doubling, which is O(n²). A 914 KB file takes
+**12.4 seconds merely to `--list` mutants**, with no compilation involved.
 
-CPU attribution from samply on the 914 KB case, after symbolication — a single
-~560-byte contiguous code region accounted for essentially all self time:
+CPU attribution from samply on a 304 KB single-file tree, idle machine, after
+symbolication — one function dominates completely:
 
 ```
-93.1%   Mutant::original_text        (mutant.rs:272)
- 0.8%   drop_glue<syn::ty::Type>
- 0.5%   syn visit_item_trait_alias
+88.4%   Mutant::original_text        (mutant.rs:272)
+ 1.5%   drop_glue<syn::attr::Meta>
+ 0.9%   drop_glue<syn::ty::Type>
+ 0.9%   syn visit_item_trait_alias
 ```
 
 ### Mechanism
@@ -90,7 +105,7 @@ pub fn extract(&self, s: &str) -> String {
 `Mutant::original_text` (`mutant.rs:272`) is a thin wrapper over it. It is called
 from `styled_parts` (`mutant.rs:255`), which `Mutant::new_discovered`
 (`mutant.rs:126`) invokes **eagerly for every candidate** — including candidates
-that are subsequently discarded by `exclude_re` and other filters.
+subsequently discarded by `exclude_re` and other filters.
 
 Total cost is therefore `O(M_f x S_f)` per file, where `M_f` is the number of
 operator-genre mutants in file `f` and `S_f` is its size. Both grow linearly with
@@ -105,10 +120,11 @@ Two independent changes, either of which helps and which compose well:
 
 1. Precompute a line-start byte offset index once per `SourceFile` (the text is
    already held in an `Arc<String>`, so the index can live beside it) and resolve
-   spans by byte slicing instead of scanning. This makes `extract`/`replace` O(span
-   length) instead of O(file size).
-2. Make the human-readable mutant name lazy, computed after the exclusion filters
-   rather than during `new_discovered`, so discarded candidates cost nothing.
+   spans by byte slicing instead of scanning. This makes `extract`/`replace`
+   O(span length) instead of O(file size).
+2. Make the human-readable mutant name lazy, computed after the exclusion
+   filters rather than during `new_discovered`, so discarded candidates cost
+   nothing.
 
 ### Reproduction
 
@@ -121,31 +137,32 @@ samply record --save-only -o /tmp/p.json.gz -- \
 atos -o target/release/cargo-mutants -arch arm64 -l 0x100000000 0x1000d740c
 ```
 
-## 2. Dropping the `syn` AST costs 36.7% of CPU on a normal tree
+## 2. Fixed 50 ms subprocess poll interval
 
-On the cargo-mutants tree itself — i.e. ordinary file sizes, where finding #1 has
-not yet blown up — the profile is dominated by something else entirely:
+`process.rs:27` defines `WAIT_POLL_INTERVAL = Duration::from_millis(50)`, slept
+in the wait loop at `process.rs:63`:
 
+```rust
+let process_status = loop {
+    if let Some(exit_status) = child.poll()? { break exit_status; }
+    console.tick();
+    sleep(WAIT_POLL_INTERVAL);
+};
 ```
-36.7%   core::ptr::drop_glue<syn::ty::Type>
-10.1%   Mutant::original_text
- 5.3%   syn visit_pat / DiscoveryVisitor
- 4.7%   core::ptr::drop_glue<syn::attr::Meta>
-```
 
-Over a third of CPU time is spent **deallocating** the parsed AST, not parsing or
-walking it.
+Child completion is detected up to 50 ms late, ~25 ms on average. With two
+phases per mutant (build + test) and 776 mutants, that is roughly **39 seconds
+of dead time** per run. Spread across parallel workers the wall-clock cost is
+smaller — of order 3 s at 12 threads — but it is pure idle latency on every
+scenario and it is entirely avoidable.
 
-Note that `syn` is configured with the `extra-traits` feature (`Cargo.toml:78`),
-which adds `Debug`/`Eq`/`Hash` impls to every `syn` type. A grep found no use of
-those traits on `syn` types in `src/`. Worth confirming whether the feature can be
-dropped — it affects both generated code size and compile time.
+This is arithmetic from a compile-time constant, so unlike the wall-clock
+figures elsewhere it is unaffected by machine load.
 
-Because the process parses each file, visits it, then drops the AST, one option is
-to avoid running destructors for ASTs that are provably dead. This trades memory
-for time and must be bounded: discovery is followed by a long test phase, so
-leaking every AST for the whole run is not acceptable on large workspaces. Measure
-before committing to this.
+Replacing the poll with a blocking `wait()` on a dedicated waiter thread (or a
+SIGCHLD/self-pipe wakeup) removes it. Note that `console.tick()` is currently
+driven by the same loop, so progress-bar refresh must be decoupled as part of
+the same change rather than inheriting the new wait mechanism's cadence.
 
 ## 3. `outcomes.json` is rewritten in full after every mutant
 
@@ -166,102 +183,100 @@ fn write_lab_outcome(&self) -> Result<()> {
 Total bytes serialized and written over a run of N mutants is proportional to
 `sum(1..N)`, i.e. O(N²).
 
-Measured on `testdata/small_well_tested`: **1543 bytes per outcome**.
-Extrapolated to this repo's own 776 mutants, the final file is ~1.2 MB but the run
-writes roughly **465 MB** in total — an amplification factor of ~388x, along with
+Measured on `testdata/small_well_tested`: **1543 bytes per outcome**. This is a
+file-size measurement, so it is unaffected by the load problem described above.
+Extrapolated to this repo's own 776 mutants, the final file is ~1.2 MB but the
+run writes roughly **465 MB** in total — an amplification factor of ~388x, plus
 the matching JSON serialization CPU.
 
 Additionally, `output.rs:210` does `scenario_outcome.to_owned()` on a value the
 caller already owns — an avoidable deep clone once per mutant.
 
 Suggested fix: append incrementally (JSON Lines), or keep the current format but
-throttle rewrites on a timer, writing the complete document once at the end. Take
-the owned value instead of cloning.
+throttle rewrites on a timer and write the complete document once at the end.
+Take the owned value instead of cloning.
 
-## 4. Three cargo subprocesses at startup, one of them redundant
+## 4. `syn` AST teardown
 
-`--list` on this repo takes **530 ms**, of which only ~130 ms is cargo-mutants'
-own CPU. The remainder is waiting on cargo subprocesses.
-
-Captured with a `$CARGO` shim that logs each invocation:
+On the cargo-mutants tree itself — ordinary file sizes, where finding #1 has not
+yet blown up — `--list` takes **95.5 ms** total and the profile is diffuse:
 
 ```
-locate-project --workspace                       ~140 ms
-metadata --format-version 1 --no-deps ...        ~120 ms
-locate-project                                   ~140 ms   <- redundant
+12.9%   drop_glue<syn::attr::Meta>
+12.9%   syn visit_pat / DiscoveryVisitor
+11.3%   Mutant::original_text
+ 4.8%   drop_glue<syn::ty::Type>
 ```
+
+Roughly 18% of CPU goes to **deallocating** the parsed AST rather than parsing or
+walking it. This is worth attention but is not the dominant cost it appeared to
+be in the contaminated first pass.
+
+`syn` is configured with the `extra-traits` feature (`Cargo.toml:78`), which adds
+`Debug`/`Eq`/`Hash` impls to every `syn` type. A grep found no use of those traits
+on `syn` types in `src/`. Worth confirming whether the feature can be dropped — it
+affects generated code size and compile time.
+
+## 5. Three cargo subprocesses at startup, one of them redundant
+
+`--list` on this repo takes **95.5 ms**. Captured with a `$CARGO` shim that logs
+each invocation:
+
+| invocation | cost |
+|---|---|
+| `locate-project --workspace` | ~15.9 ms |
+| `metadata --format-version 1 --no-deps` | ~14.7 ms |
+| `locate-project` | ~14.6 ms (redundant) |
 
 The second `locate-project` comes from `Workspace::filter_packages`
 (`workspace.rs:137`) on the `PackageFilter::Auto` path. The `Metadata` fetched
 moments earlier at `workspace.rs:102` already contains `workspace_root` and the
-`manifest_path` of every workspace member, which is sufficient to find the package
+`manifest_path` of every workspace member, which is enough to find the package
 directory closest to the start directory without spawning cargo again.
 
-Removing it saves ~140 ms, about **26% of `--list` wall time**, on every run.
+Removing it saves ~15 ms, about **15% of `--list` wall time**, on every run.
 
-Already correct, for the record: `no_deps()` is set at `workspace.rs:103`. Measured
-locally, `cargo metadata` **with** dependencies costs 330-475 ms versus ~120 ms
-without, so this flag is worth 200-350 ms and should not be removed.
-
-## 5. Fixed 50 ms subprocess poll interval
-
-`process.rs:27` defines `WAIT_POLL_INTERVAL = Duration::from_millis(50)`, slept in
-the wait loop at `process.rs:63`:
-
-```rust
-let process_status = loop {
-    if let Some(exit_status) = child.poll()? { break exit_status; }
-    console.tick();
-    sleep(WAIT_POLL_INTERVAL);
-};
-```
-
-Child completion is therefore detected up to 50 ms late, ~25 ms on average. With
-two phases per mutant (build + test) and 776 mutants, that is roughly **39 seconds
-of pure sleep** per run, spread across worker threads.
-
-Replacing the poll with a blocking `wait()` on a dedicated waiter thread (or a
-SIGCHLD/self-pipe wakeup) removes this. Note that `console.tick()` is currently
-driven by the same loop, so progress-bar refresh must be decoupled as part of the
-same change rather than inheriting whatever cadence the new wait mechanism has.
+Already correct, for the record: `no_deps()` is set at `workspace.rs:103`.
+Measured locally, `cargo metadata` **with** dependencies costs 62.7 ms versus
+14.7 ms without, so the flag is worth ~48 ms and should not be removed.
 
 ## 6. Test suite
 
-Full suite: **90.5 s wall**, 924 CPU-seconds, 430 tests, 12 cores. Parallel
-efficiency is 85% (77.0 s theoretical minimum vs 90.5 s observed) — the suite is
-CPU-saturated, not serialization-limited. The 290 unit tests finish in 4.98 s and
-are not a problem; the cost is entirely in the `tests/main.rs` CLI integration
-suite. 44 tests exceed 5 s, 27 exceed 15 s.
+Measured with `cargo test --all-features` (nextest is not installed here, so
+per-test timings could not be collected):
 
-DESIGN.md ("Test performance") already states that CLI tests should prefer
-`--list` over running all mutants. Seven tests run a **full** mutation run
-(baseline plus every mutant of a 4-mutant testdata crate) but assert only
-`.assert().success()` — none inspects which mutants were caught or missed:
+- 290 unit tests, in-process: **0.08 s**. Not a problem.
+- `tests/main.rs` integration suite, 140 tests: **96.15 s**. This is the cost.
+- 5 failures, all environmental rather than performance-related: 3 depend on
+  ambient colour env vars (`cargo_term_color_env_shows_colors`,
+  `clicolor_force_shows_in_stdout_and_trace`,
+  `colors_always_shows_in_stdout_and_trace`) and 2 require nextest to be
+  installed (`test_with_nextest_on_small_tree`,
+  `unexpected_nextest_error_code_causes_a_warning`).
 
-| test (`tests/main.rs`) | duration |
-|---|---|
-| `additional_cargo_test_args` | 18.93 s |
-| `cargo_test_arg_option` | 18.34 s |
-| `all_features_config_option` | 18.22 s |
-| `cargo_test_arg_and_additional_cargo_test_args_combined` | 18.08 s |
-| `features_config_option` | 17.83 s |
-| `cargo_test_arg_multiple_options` | 17.52 s |
-| `additional_cargo_args` | 17.44 s |
+DESIGN.md ("Test performance") states that CLI tests should prefer `--list` over
+running all mutants. Seven tests violate this. Each copies the
+`testdata/fails_without_feature` tree and runs a **full** mutation run — baseline
+plus every mutant — while asserting only `.assert().success()`. None inspects
+which mutants were caught or missed. Verified by reading each test body:
 
-Total 126 s. Each verifies only that a flag is plumbed through to the underlying
-cargo invocation, which `--check` (build only, no test phase) would establish at
-roughly one fifth the cost. Estimated saving ~100 s.
+- `additional_cargo_test_args`
+- `cargo_test_arg_option`
+- `all_features_config_option`
+- `cargo_test_arg_and_additional_cargo_test_args_combined`
+- `features_config_option`
+- `cargo_test_arg_multiple_options`
+- `additional_cargo_args`
 
-Separately, `cross_package_tests` (60.79 s, the single slowest test) performs five
-sequential `cargo mutants` invocations inside one `#[test]` function. It alone sets
-the floor on suite wall time, since no amount of additional cores can shorten it.
-Splitting it into five `#[test]` functions lets nextest schedule them across cores;
-total CPU cost is unchanged and no assertion is lost.
+Each verifies only that a flag is plumbed through to the underlying cargo
+invocation. `--check` (build only, no test phase) would establish that at a
+fraction of the cost, since the assertion does not depend on mutants actually
+being tested.
 
-Three tests failed during measurement (`cargo_term_color_env_shows_colors`,
-`clicolor_force_shows_in_stdout_and_trace`, `colors_always_shows_in_stdout_and_trace`).
-These are sensitive to ambient colour-related environment variables in the
-measuring shell and are unrelated to performance.
+Separately, `cross_package_tests` performs five sequential `cargo mutants`
+invocations inside one `#[test]` function. Splitting it into five `#[test]`
+functions would let the runner schedule them across cores; total CPU cost is
+unchanged and no assertion is lost.
 
 ---
 
@@ -274,10 +289,10 @@ Recording these explicitly so the same ground is not re-covered.
   `/var/folders` (`reflink_used=true` in `debug.log`). `copy_target` defaults to
   `false` (`options.rs:362`), so `target/` is *not* copied unless explicitly
   requested, and per-job build dir copies run concurrently inside `thread::scope`,
-  not serially. **Latent risk:** if reflink ever fails — e.g. `$TMPDIR` on a
-  different volume, or some CI containers — the fallback to full byte copies is
-  silent, logged only at `debug!` level (`copy_tree.rs:53-60`). Promoting this to
-  a one-shot `warn!` would make a severe degradation diagnosable.
+  not serially. **Latent risk:** if reflink ever fails — `$TMPDIR` on a different
+  volume, some CI containers — the fallback to full byte copies is silent, logged
+  only at `debug!` level (`copy_tree.rs:53-60`). Promoting that to a one-shot
+  `warn!` would make a severe degradation diagnosable.
 - **CPU oversubscription.** Not present. A single `jobserver::Client` is created
   once (`lab.rs:56-61`) and shared by all workers, so total compile-job
   concurrency is capped at NCPU process-wide rather than NCPU per worker. This
@@ -309,3 +324,23 @@ Recording these explicitly so the same ground is not re-covered.
 - **Per-scenario argv construction.** `cargo_argv` (`cargo.rs:96`) allocates a
   handful of small `String`s per mutant-phase, negligible beside the compile it
   precedes.
+
+## Benchmark harness
+
+`autoresearch.sh` at the repo root measures the items above that can be measured
+reliably. It generates its own fixtures (never the live `src/` tree, which would
+drift as the crate is optimized), reports `total_ms` over three discovery
+workloads as the primary metric, and gates on the unit tests plus exact mutant
+counts so a faster-but-wrong build cannot score well.
+
+Baseline at `fe82f18`:
+
+```
+METRIC total_ms=1572.7
+METRIC list_mixed_ms=71.0
+METRIC list_bigfile_ms=1435.6
+METRIC list_manyfiles_ms=66.0
+METRIC e2e_ms=10704.3
+METRIC cargo_spawns=3
+METRIC mutants_total=11280
+```
