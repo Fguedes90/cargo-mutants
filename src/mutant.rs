@@ -183,8 +183,7 @@ impl Mutant {
     /// Return a one-line description of this mutant, with coloring, including the file names
     /// and optionally the line and column.
     pub fn to_styled_string(&self, show_line_col: bool) -> String {
-        let mut v = Vec::new();
-        v.push(self.source_file.tree_relative_slashes());
+        let mut v = vec![self.source_file.tree_relative_slashes().to_owned()];
         if show_line_col {
             v.push(format!(
                 ":{}:{}",
@@ -295,7 +294,7 @@ impl Mutant {
         TextDiff::from_lines(self.source_file.code(), mutated_code)
             .unified_diff()
             .context_radius(8)
-            .header(&old_label, &new_label)
+            .header(old_label, &new_label)
             .to_string()
     }
 
@@ -320,7 +319,7 @@ impl Mutant {
         // with similar mutants on the same line?
         format!(
             "{filename}_line_{line}_col_{col}",
-            filename = clean_filename(&self.source_file.tree_relative_slashes()),
+            filename = clean_filename(self.source_file.tree_relative_slashes()),
             line = self.span.start.line,
             col = self.span.start.column,
         )

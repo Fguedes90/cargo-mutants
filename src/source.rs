@@ -46,6 +46,12 @@ pub struct SourceFile {
     /// Cached alongside the text so that resolving the span of each mutant in
     /// this file does not rescan it from the start.
     line_index: Arc<LineIndex>,
+
+    /// `tree_relative_path` with forward slashes.
+    ///
+    /// Cached because it is the same for every mutant in the file, but is
+    /// needed to name each of them.
+    slash_path: String,
 }
 
 #[allow(clippy::missing_fields_in_debug)] // intentional
@@ -88,6 +94,7 @@ impl SourceFile {
         );
         let line_index = Arc::new(LineIndex::new(&code));
         Ok(Some(SourceFile {
+            slash_path: tree_relative_path.to_slash_path(),
             tree_relative_path: tree_relative_path.to_owned(),
             code,
             line_index,
@@ -113,6 +120,7 @@ impl SourceFile {
         let code = Arc::new(code.to_owned());
         let line_index = Arc::new(LineIndex::new(&code));
         SourceFile {
+            slash_path: tree_relative_path.to_slash_path(),
             tree_relative_path,
             code,
             line_index,
@@ -127,8 +135,8 @@ impl SourceFile {
     }
 
     /// Return the path of this file relative to the tree root, with forward slashes.
-    pub fn tree_relative_slashes(&self) -> String {
-        self.tree_relative_path.to_slash_path()
+    pub fn tree_relative_slashes(&self) -> &str {
+        &self.slash_path
     }
 
     pub fn path(&self) -> &Utf8Path {

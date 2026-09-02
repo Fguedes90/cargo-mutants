@@ -428,7 +428,7 @@ impl DiscoveryVisitor<'_> {
                             || path_is(a.path(), &["cfg_attr"])
                     })
                     .map_or_else(
-                        || self.source_file.tree_relative_slashes(),
+                        || self.source_file.tree_relative_slashes().to_owned(),
                         |a| {
                             self.source_file
                                 .format_source_location(LineColumn::from(a.span().start()))
