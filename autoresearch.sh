@@ -170,9 +170,9 @@ FIX = sys.argv[2]
 # Expected discovery output per fixture. These are properties of the generated
 # fixtures; a change means mutants were lost or invented, which invalidates any
 # speedup that came with it.
-EXPECT_MUTANTS = {"w1_mixed": 1680, "w2_bigfile": 7600, "w3_manyfiles": 2000}
-EXPECT_E2E = {"outcomes": 22, "caught": 20, "missed": 1}
-REPS = 3
+EXPECT_MUTANTS = {"w1_mixed": 2040, "w2_bigfile": 7600, "w3_manyfiles": 2000}
+EXPECT_E2E = {"outcomes": 24, "caught": 22, "missed": 1}
+REPS = 5
 
 def run(args, env=None):
     return subprocess.run(args, capture_output=True, text=True, env=env)
