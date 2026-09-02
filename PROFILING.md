@@ -56,6 +56,46 @@ hot paths:
 
 Recommended order of attack by return on effort: **1 → 3 → 2 → 4 → 5 → 6**.
 
+## Status: what has since been fixed
+
+The findings above describe the tree at `fe82f18`. A follow-up optimisation pass
+addressed several of them; this section records what changed so the table above
+is not read as a description of current behaviour.
+
+| # | Finding | Status |
+|---|---|---|
+| 1 | `Span::extract` quadratic | **Fixed.** `span::LineIndex` caches per-file line-start byte offsets on `SourceFile`; span resolution is O(span) instead of O(file). Single 914 KB file: 1404 → 113 ms. |
+| 2 | 50 ms subprocess poll interval | Open. |
+| 3 | `outcomes.json` rewritten per mutant | Open. |
+| 4 | `syn` AST teardown | Open, and now a larger share of what remains: `syn` parsing alone is ~23% of a large-file discovery. Inherent to using `syn`. |
+| 5 | Redundant `cargo locate-project` | **Fixed, and then some.** Both spawns are gone: `cargo metadata` already reports `workspace_root`, and the enclosing package directory is now found by walking up for a `Cargo.toml` instead of shelling out. 3 cargo spawns per discovery run → 1. |
+| 6 | Integration tests run full mutation runs | Open. |
+
+Four further bottlenecks were found and fixed during that pass, none of which
+are in the table above because they only became visible once #1 stopped
+dominating the profile:
+
+- **A regex automaton was constructed per visited item.** `push_exclude_re`
+  pushed a `RegexSet::empty()` for every fn/impl/mod/expr scope that had no
+  `#[mutants::exclude_re]` attribute — the common case — and each empty entry
+  was then scanned for every mutant. Nothing is pushed now.
+- **Each mutant's name was built three times**: once precomputed at
+  construction, again in `allows_mutant` (even when no name filter is
+  configured), and again in `list_mutants`. The expensive half (`styled_parts`)
+  now runs once per mutant and the rest is composed from a cached description.
+- **`tree_relative_slashes()` reallocated the path string on every call**,
+  twice per mutant, though it is constant per file. Cached on `SourceFile`.
+- **`proc_macro2`'s source map is a thread-local that grows per parsed file**
+  and is scanned on every span lookup, making discovery superlinear in *file
+  count*. Each file is now parsed on its own thread, and the files in a
+  breadth-first level are walked concurrently. 1600-file tree: 588 → 232 ms.
+
+Measured on a fixed three-fixture `--list` benchmark (40-file mixed tree,
+one 304 KB file, 201-file tree; 11,280 mutants total), the sum of the three
+wall times went from 1548.8 ms to 135.7 ms. Mutant discovery output is
+byte-identical throughout, including `--list --json`.
+
+
 ---
 
 ## 1. `Span::extract` makes mutant discovery quadratic
