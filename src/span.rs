@@ -90,6 +90,11 @@ impl LineIndex {
         }
         line_end
     }
+
+    /// Byte offset of the start of 1-based `line`, or `None` past the end.
+    pub fn line_start(&self, line: usize) -> Option<usize> {
+        self.line_starts.get(line.checked_sub(1)?).copied()
+    }
 }
 
 impl Span {
@@ -136,7 +141,7 @@ impl Span {
     /// a reversed one means a mutation genre built its span wrongly: that
     /// would silently produce an empty or wrong mutation, so it is asserted in
     /// debug builds while remaining safe in release.
-    fn byte_range(&self, s: &str, line_index: &LineIndex) -> (usize, usize) {
+    pub(crate) fn byte_range(&self, s: &str, line_index: &LineIndex) -> (usize, usize) {
         let start = line_index.byte_offset(s, self.start);
         let end = line_index.byte_offset(s, self.end);
         debug_assert!(

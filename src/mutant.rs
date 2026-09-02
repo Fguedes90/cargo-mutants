@@ -19,6 +19,9 @@ use crate::output::clean_filename;
 use crate::source::SourceFile;
 use crate::span::Span;
 
+/// Unchanged lines shown on each side of a change in the generated diffs.
+const DIFF_CONTEXT_LINES: usize = 8;
+
 /// Various broad categories of mutants.
 #[derive(Clone, Eq, PartialEq, Debug, Serialize)]
 pub enum Genre {
@@ -235,6 +238,15 @@ impl Mutant {
         }
     }
 
+    /// The replacement text as it is written into the mutated file, including
+    /// the marker comment.
+    ///
+    /// Shared by [`Self::mutated_code`] and by diff generation, so that the
+    /// diff always describes exactly what would be written to disk.
+    fn replacement_with_marker(&self) -> String {
+        format!("{} {}", self.replacement, MUTATION_MARKER_COMMENT)
+    }
+
     /// Return text of the whole file with the mutation applied.
     ///
     /// The replacement is followed by [`MUTATION_MARKER_COMMENT`]. Every genre
@@ -250,7 +262,7 @@ impl Mutant {
         self.span.replace_indexed(
             self.source_file.code(),
             self.source_file.line_index(),
-            &format!("{} {}", self.replacement, MUTATION_MARKER_COMMENT),
+            &self.replacement_with_marker(),
         )
     }
 
@@ -424,16 +436,58 @@ impl Mutant {
 
     /// Return a unified diff for the mutant.
     ///
-    /// The mutated text must be passed in because we should have already computed
-    /// it, and don't want to pointlessly recompute it here.
-    pub fn diff(&self, mutated_code: &str) -> String {
-        let old_label = self.source_file.tree_relative_slashes();
+    /// Only the neighbourhood of the mutated span is diffed. Diffing whole
+    /// files costs O(file) per mutant — `similar` tokenizes and hashes every
+    /// line of both sides — and `mutants.json` carries a diff for every
+    /// mutant, so a large file used to cost O(mutants x file size) before a
+    /// single test was run. Lines further than the context radius from the
+    /// span are identical on both sides and so cannot appear in the output;
+    /// the hunk headers are renumbered afterwards to the positions a
+    /// whole-file diff would have reported.
+    ///
+    /// The mutated side is built for the window alone, so the whole mutated
+    /// file is never materialised just to be diffed.
+    fn diff(&self) -> String {
+        let orig = self.source_file.code();
+        let line_index = self.source_file.line_index();
+        let (lo, hi) = self.span.byte_range(orig, line_index);
+        let replacement = self.replacement_with_marker();
+
+        let first_line = self
+            .span
+            .start
+            .line
+            .saturating_sub(DIFF_CONTEXT_LINES)
+            .max(1);
+        // A window that doesn't contain the span would give a wrong diff, so
+        // fall back to the whole file rather than trust inconsistent input.
+        match line_index
+            .line_start(first_line)
+            .filter(|&win_lo| win_lo <= lo)
+        {
+            Some(win_lo) => {
+                let win_hi = line_index
+                    .line_start(self.span.end.line + DIFF_CONTEXT_LINES + 1)
+                    .unwrap_or(orig.len())
+                    .max(hi);
+                let mut new_window = String::with_capacity(win_hi - win_lo + replacement.len());
+                new_window.push_str(&orig[win_lo..lo]);
+                new_window.push_str(&replacement);
+                new_window.push_str(&orig[hi..win_hi]);
+                let diff = self.unified_diff(&orig[win_lo..win_hi], &new_window);
+                renumber_hunks(&diff, first_line - 1)
+            }
+            None => self.unified_diff(orig, &self.mutated_code()),
+        }
+    }
+
+    fn unified_diff(&self, old: &str, new: &str) -> String {
         // There shouldn't be any newlines, but just in case...
         let new_label = self.describe_change().replace('\n', " ");
-        TextDiff::from_lines(self.source_file.code(), mutated_code)
+        TextDiff::from_lines(old, new)
             .unified_diff()
-            .context_radius(8)
-            .header(old_label, &new_label)
+            .context_radius(DIFF_CONTEXT_LINES)
+            .header(self.source_file.tree_relative_slashes(), &new_label)
             .to_string()
     }
 
@@ -444,7 +498,7 @@ impl Mutant {
     /// directory when it is applied, so the diff of every tested mutant would
     /// otherwise be computed twice.
     pub fn cached_diff(&self) -> &str {
-        self.diff.get_or_init(|| self.diff(&self.mutated_code()))
+        self.diff.get_or_init(|| self.diff())
     }
 
     /// Apply this mutant to the relevant file within a `BuildDir`.
@@ -502,6 +556,54 @@ impl Serialize for Mutant {
         ss.serialize_field("genre", &self.genre)?;
         ss.end()
     }
+}
+
+/// Shift the line numbers in every `@@ -a,b +c,d @@` header by `offset`.
+///
+/// The diff was computed over a window of the file, so its hunks are numbered
+/// from the start of that window. This restores the numbering that a
+/// whole-file diff would have produced. Anything that doesn't parse as a hunk
+/// header is passed through untouched, so a body line that happens to start
+/// with `@@ -` cannot be corrupted into something else.
+fn renumber_hunks(diff: &str, offset: usize) -> String {
+    if offset == 0 {
+        return diff.to_owned();
+    }
+    let mut out = String::with_capacity(diff.len());
+    for line in diff.split_inclusive('\n') {
+        match renumber_hunk_header(line, offset) {
+            Some(header) => out.push_str(&header),
+            None => out.push_str(line),
+        }
+    }
+    out
+}
+
+/// Rewrite one `@@ -a,b +c,d @@` header, or `None` if `line` isn't one.
+fn renumber_hunk_header(line: &str, offset: usize) -> Option<String> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (old, rest) = rest.split_once(" +")?;
+    let (new, tail) = rest.split_once(" @@")?;
+    let old = shift_hunk_range(old, offset)?;
+    let new = shift_hunk_range(new, offset)?;
+    Some(format!("@@ -{old} +{new} @@{tail}"))
+}
+
+/// Add `offset` to the start line of an `a,b` (or bare `a`) hunk range.
+///
+/// A start of 0, which unified diff uses for an empty side, is left alone:
+/// there is no line 0 to move.
+fn shift_hunk_range(range: &str, offset: usize) -> Option<String> {
+    let (start, count) = match range.split_once(',') {
+        Some((start, count)) => (start, Some(count)),
+        None => (range, None),
+    };
+    let start: usize = start.parse().ok()?;
+    let start = if start == 0 { 0 } else { start + offset };
+    Some(match count {
+        Some(count) => format!("{start},{count}"),
+        None => start.to_string(),
+    })
 }
 
 /// Combine multiple lines to one, removing indentation following a newline.
