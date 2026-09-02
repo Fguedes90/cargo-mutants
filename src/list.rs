@@ -5,39 +5,49 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+use std::io::Write;
+
 use itertools::Itertools;
 use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 
-use crate::Options;
 use crate::mutant::Mutant;
 use crate::path::Utf8PathSlashes;
 use crate::source::SourceFile;
+use crate::{Context, Options, Result};
 
-/// Return a string representation of a list of mutants.
+/// Write a list of mutants to `out`.
 ///
 /// The format is controlled by the `emit_json`, `emit_diffs`, `show_line_col`, and `colors` options.
-pub fn list_mutants(mutants: &[Mutant], options: &Options) -> String {
+///
+/// Written straight to `out` rather than returned as a string: the JSON
+/// rendering of a large tree runs to many megabytes, and building it as a
+/// string first costs that again plus the slack of growing it.
+pub fn write_mutants(out: &mut impl Write, mutants: &[Mutant], options: &Options) -> Result<()> {
     if options.emit_json {
-        mutants_to_json_string(mutants)
+        serde_json::to_writer_pretty(out, &MutantsJson(mutants)).context("serialize mutants")
     } else {
         // TODO: Do we need to check this? Could the console library strip them if they're not
         // supported?
         let colors = options.colors.active_stdout();
-        let mut out = String::with_capacity(200 * mutants.len());
+        // One buffer, reused for every mutant, so that the names and diffs
+        // don't each allocate on their way to `out`.
+        let mut line = String::new();
         for mutant in mutants {
+            line.clear();
             if colors {
-                out.push_str(&mutant.to_styled_string(options.show_line_col));
+                line.push_str(&mutant.to_styled_string(options.show_line_col));
             } else {
-                mutant.write_name(options.show_line_col, &mut out);
+                mutant.write_name(options.show_line_col, &mut line);
             }
-            out.push('\n');
+            line.push('\n');
             if options.emit_diffs() {
-                out.push_str(&mutant.diff());
-                out.push('\n');
+                line.push_str(&mutant.diff());
+                line.push('\n');
             }
+            out.write_all(line.as_bytes())?;
         }
-        out
+        Ok(())
     }
 }
 
@@ -75,15 +85,7 @@ pub fn list_files(source_files: &[SourceFile], options: &Options) -> String {
 pub struct MutantsJson<'a>(pub &'a [Mutant]);
 
 impl Serialize for MutantsJson<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         serializer.collect_seq(self.0.iter().map(Mutant::to_json))
     }
-}
-
-/// Convert a slice of mutants to a pretty-printed JSON string.
-///
-/// Each mutant includes its diff. Used for `--list --json`; `mutants.json` is
-/// written straight to the file instead, without going through a string.
-pub fn mutants_to_json_string(mutants: &[Mutant]) -> String {
-    serde_json::to_string_pretty(&MutantsJson(mutants)).expect("Serialize mutants")
 }

@@ -48,7 +48,7 @@ mod visit;
 mod workspace;
 
 use std::env;
-use std::io;
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -70,7 +70,7 @@ use crate::{
     in_diff::diff_filter_file,
     interrupt::check_interrupted,
     lab::test_mutants,
-    list::{list_files, list_mutants},
+    list::{list_files, write_mutants},
     mutant::{Genre, Mutant},
     options::{Colors, Common, Options},
     outcome::{Phase, ScenarioOutcome},
@@ -639,7 +639,7 @@ fn main() -> Result<ExitCode> {
         mutants = options.sharding().shard(*shard, mutants);
     }
     if args.list {
-        print!("{}", list_mutants(&mutants, &options));
+        write_mutants_to_stdout(&mutants, &options)?;
         Ok(ExitCode::Success)
     } else {
         let output_dir = OutputDir::new(&output_parent_dir)?;
@@ -660,6 +660,17 @@ fn emit_schema(schema_type: SchemaType) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Write the mutant list to stdout, buffered.
+///
+/// Buffered because the list is written a mutant at a time, and for a large
+/// tree with `--diff` or `--json` that is megabytes of small writes.
+fn write_mutants_to_stdout(mutants: &[Mutant], options: &Options) -> Result<()> {
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    write_mutants(&mut out, mutants, options)?;
+    out.flush().context("flush stdout")
 }
 
 /// Mutate one file, that does not need to be in a Cargo workspace, and list the mutants generated,
@@ -684,7 +695,7 @@ fn mutate_file(path: &Path, options: &Options) -> Result<()> {
     .context("load source file")?
     .context("single source file is outside of tree??")?;
     let (mutants, _mod_refs) = walk_file(&source_file, options)?;
-    print!("{}", list_mutants(&mutants, options));
+    write_mutants_to_stdout(&mutants, options)?;
     Ok(())
 }
 
