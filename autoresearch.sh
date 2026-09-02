@@ -162,7 +162,7 @@ PYEOF
 
 echo "== workloads =="
 python3 - "$BIN" "$FIXTURES" <<'PYEOF'
-import json, os, subprocess, sys, time
+import json, os, statistics, subprocess, sys, time
 
 BIN = os.path.abspath(sys.argv[1])
 FIX = sys.argv[2]
@@ -172,15 +172,24 @@ FIX = sys.argv[2]
 # speedup that came with it.
 EXPECT_MUTANTS = {"w1_mixed": 2040, "w2_bigfile": 7600, "w3_manyfiles": 2000}
 EXPECT_E2E = {"outcomes": 24, "caught": 22, "missed": 1}
-REPS = 5
+# 21 reps, not a handful: the many-small-files workload spawns one thread per
+# file, and its wall time is broad and right-skewed (measured spread ~37-46 ms
+# for one fixed binary). A min-of-5 on that distribution does not converge and
+# reports differences between builds that are really just draws from the same
+# distribution. 21 reps costs ~3 s and makes the minimum stable.
+REPS = 21
 
 def run(args, env=None):
     return subprocess.run(args, capture_output=True, text=True, env=env)
 
 def timed(args):
-    """Min-of-REPS wall time in ms. Min is the robust estimator: it is the run
-    least perturbed by unrelated load on the machine."""
-    best, out = None, None
+    """Return (min, median) wall time in ms over REPS runs, and the last stdout.
+
+    The minimum is the primary estimator: it is the run least perturbed by
+    unrelated load. The median is reported alongside it only so that a run
+    whose distribution has shifted (a genuinely slower build) can be told
+    apart from one that merely drew a lucky minimum."""
+    times, out = [], None
     for _ in range(REPS):
         t = time.perf_counter()
         r = run(args)
@@ -189,19 +198,21 @@ def timed(args):
             sys.stderr.write("workload failed: %s\n%s\n%s\n"
                              % (args, r.stdout[-2000:], r.stderr[-2000:]))
             sys.exit(1)
-        best = dt if best is None else min(best, dt)
+        times.append(dt)
         out = r.stdout
-    return best, out
+    times.sort()
+    return times[0], statistics.median(times), out
 
-results, counts, errs = {}, {}, []
+results, medians, counts, errs = {}, {}, {}, []
 
 for key, name in (("list_mixed_ms", "w1_mixed"),
                   ("list_bigfile_ms", "w2_bigfile"),
                   ("list_manyfiles_ms", "w3_manyfiles")):
-    ms, out = timed([BIN, "mutants", "--list", "-d", os.path.join(FIX, name)])
+    ms, med, out = timed([BIN, "mutants", "--list", "-d", os.path.join(FIX, name)])
     results[key] = ms
+    medians[key] = med
     counts[name] = len([l for l in out.splitlines() if l.strip()])
-    print(f"  {name:14s} {ms:9.1f} ms   mutants={counts[name]}")
+    print(f"  {name:14s} min={ms:8.1f} ms  median={med:8.1f} ms   mutants={counts[name]}")
 
 # End-to-end. --jobs 1 keeps scheduling deterministic.
 e2e_dir = os.path.join(FIX, "w4_e2e")
@@ -257,8 +268,10 @@ spawns = sum(1 for _ in open(log)) if os.path.exists(log) else 0
 print(f"  cargo spawns per discovery run: {spawns}")
 
 total = results["list_mixed_ms"] + results["list_bigfile_ms"] + results["list_manyfiles_ms"]
+total_median = sum(medians.values())
 print()
 print("METRIC total_ms=%.1f" % total)
+print("METRIC total_median_ms=%.1f" % total_median)
 for k in ("list_mixed_ms", "list_bigfile_ms", "list_manyfiles_ms"):
     print("METRIC %s=%.1f" % (k, results[k]))
 print("METRIC e2e_ms=%.1f" % e2e_ms)
