@@ -477,9 +477,12 @@ impl Options {
 
     /// True if the options allow this mutant to be tested.
     pub fn allows_mutant(&self, mutant: &Mutant) -> bool {
-        let name = mutant.name(true);
-        (self.examine_name_re.is_empty() || self.examine_name_re.is_match(&name))
-            && (self.exclude_name_re.is_empty() || !self.exclude_name_re.is_match(&name))
+        // `Mutant::name` is precomputed at construction as `name(true)`, so
+        // rebuilding it here would repeat that work for every mutant, even
+        // when neither filter is configured.
+        let name = &mutant.name;
+        (self.examine_name_re.is_empty() || self.examine_name_re.is_match(name))
+            && (self.exclude_name_re.is_empty() || !self.exclude_name_re.is_match(name))
     }
 
     pub fn emit_diffs(&self) -> bool {
