@@ -23,66 +23,88 @@ where
     T: ToTokens,
 {
     fn to_pretty_string(&self) -> String {
-        use TokenTree::{Group, Ident, Literal, Punct};
         let mut b = String::with_capacity(200);
-        let mut ts = self.to_token_stream().into_iter().peekable();
-        while let Some(tt) = ts.next() {
-            match tt {
-                Punct(p) => {
-                    let pc = p.as_char();
-                    if pc == '|' && !b.is_empty() && !b.ends_with(' ') && !b.ends_with('|') {
-                        // Generally have spaces around '|' in match arms (or bitwise expressions)
-                        b.push(' ');
-                    }
-                    b.push(pc);
-                    if ts.peek().is_some() && (b.ends_with("->") || pc == ',' || pc == ';') {
-                        b.push(' ');
-                    }
+        write_pretty(self.to_token_stream(), &mut b);
+        b
+    }
+}
+
+/// Append the pretty-printed form of `ts` to `b`.
+///
+/// Groups recurse into the same buffer rather than into a fresh `String` that
+/// is then copied in: a nested type like `Result<Option<Vec<String>>, E>`
+/// would otherwise allocate once per level.
+///
+/// The spacing rules look only at the text this token stream has produced
+/// itself, not at whatever the caller had already written, so every position
+/// test is relative to `start`. That matters for a group whose delimiter is
+/// `Delimiter::None`, which emits no opening character to separate it from the
+/// text before it.
+fn write_pretty(ts: proc_macro2::TokenStream, b: &mut String) {
+    use TokenTree::{Group, Ident, Literal, Punct};
+    let start = b.len();
+    let mut ts = ts.into_iter().peekable();
+    while let Some(tt) = ts.next() {
+        match tt {
+            Punct(p) => {
+                let pc = p.as_char();
+                let emitted = &b[start..];
+                if pc == '|'
+                    && !emitted.is_empty()
+                    && !emitted.ends_with(' ')
+                    && !emitted.ends_with('|')
+                {
+                    // Generally have spaces around '|' in match arms (or bitwise expressions)
+                    b.push(' ');
                 }
-                Ident(_) | Literal(_) => {
-                    if b.ends_with('=') || b.ends_with("=>") || b.ends_with('|') {
-                        b.push(' ');
-                    }
-                    match tt {
-                        Literal(l) => b.push_str(&l.to_string()),
-                        Ident(i) => b.push_str(&i.to_string()),
-                        _ => unreachable!(),
-                    }
-                    if let Some(next) = ts.peek() {
-                        match next {
-                            Ident(_) | Literal(_) => b.push(' '),
-                            Punct(p) => match p.as_char() {
-                                ',' | ';' | '<' | '>' | ':' | '.' | '!' => (),
-                                _ => b.push(' '),
-                            },
-                            Group(_) => (),
-                        }
-                    }
+                b.push(pc);
+                if ts.peek().is_some() && (b[start..].ends_with("->") || pc == ',' || pc == ';') {
+                    b.push(' ');
                 }
-                Group(g) => {
-                    match g.delimiter() {
-                        Delimiter::Brace => b.push('{'),
-                        Delimiter::Bracket => b.push('['),
-                        Delimiter::Parenthesis => b.push('('),
-                        Delimiter::None => (),
-                    }
-                    b += &g.stream().to_pretty_string();
-                    match g.delimiter() {
-                        Delimiter::Brace => b.push('}'),
-                        Delimiter::Bracket => b.push(']'),
-                        Delimiter::Parenthesis => b.push(')'),
-                        Delimiter::None => (),
+            }
+            Ident(_) | Literal(_) => {
+                let emitted = &b[start..];
+                if emitted.ends_with('=') || emitted.ends_with("=>") || emitted.ends_with('|') {
+                    b.push(' ');
+                }
+                match tt {
+                    Literal(l) => b.push_str(&l.to_string()),
+                    Ident(i) => b.push_str(&i.to_string()),
+                    _ => unreachable!(),
+                }
+                if let Some(next) = ts.peek() {
+                    match next {
+                        Ident(_) | Literal(_) => b.push(' '),
+                        Punct(p) => match p.as_char() {
+                            ',' | ';' | '<' | '>' | ':' | '.' | '!' => (),
+                            _ => b.push(' '),
+                        },
+                        Group(_) => (),
                     }
                 }
             }
+            Group(g) => {
+                match g.delimiter() {
+                    Delimiter::Brace => b.push('{'),
+                    Delimiter::Bracket => b.push('['),
+                    Delimiter::Parenthesis => b.push('('),
+                    Delimiter::None => (),
+                }
+                write_pretty(g.stream(), b);
+                match g.delimiter() {
+                    Delimiter::Brace => b.push('}'),
+                    Delimiter::Bracket => b.push(']'),
+                    Delimiter::Parenthesis => b.push(')'),
+                    Delimiter::None => (),
+                }
+            }
         }
-        debug_assert!(
-            !b.ends_with(' '),
-            "generated a trailing space: ts={ts:?}, b={b:?}",
-            ts = self.to_token_stream(),
-        );
-        b
     }
+    debug_assert!(
+        !b[start..].ends_with(' '),
+        "generated a trailing space: {:?}",
+        &b[start..]
+    );
 }
 
 #[cfg(test)]
