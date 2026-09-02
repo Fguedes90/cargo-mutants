@@ -162,7 +162,7 @@ PYEOF
 
 echo "== workloads =="
 python3 - "$BIN" "$FIXTURES" <<'PYEOF'
-import json, os, statistics, subprocess, sys, time
+import hashlib, json, os, statistics, subprocess, sys, time
 
 BIN = os.path.abspath(sys.argv[1])
 FIX = sys.argv[2]
@@ -172,6 +172,10 @@ FIX = sys.argv[2]
 # speedup that came with it.
 EXPECT_MUTANTS = {"w1_mixed": 2040, "w2_bigfile": 7600, "w3_manyfiles": 2000}
 EXPECT_E2E = {"outcomes": 24, "caught": 22, "missed": 1}
+# SHA-256 (truncated) of the full `--list --diff` output per fixture. Pinned so
+# that any change to the generated unified diffs is a hard failure.
+EXPECT_DIFF_SHA = {"w1_mixed": "32a7997e11a31a86",
+                   "w2_bigfile": "16af60bc09d9503c"}
 # 21 reps, not a handful: the many-small-files workload spawns one thread per
 # file, and its wall time is broad and right-skewed (measured spread ~37-46 ms
 # for one fixed binary). A min-of-5 on that distribution does not converge and
@@ -214,6 +218,27 @@ for key, name in (("list_mixed_ms", "w1_mixed"),
     counts[name] = len([l for l in out.splitlines() if l.strip()])
     print(f"  {name:14s} min={ms:8.1f} ms  median={med:8.1f} ms   mutants={counts[name]}")
 
+# Unified-diff generation, which every real run pays before it starts testing:
+# `mutants.out/mutants.json` carries a diff for every mutant. Timed on its own
+# because it is generated per mutant from the whole file, so it dominates the
+# cost of a large-file tree by two orders of magnitude over discovery.
+#
+# Fewer reps: this workload is slow and, being pure CPU with no threads, is
+# also far less noisy than the discovery ones.
+diff_digests = {}
+for key, name in (("diff_mixed_ms", "w1_mixed"),
+                  ("diff_bigfile_ms", "w2_bigfile")):
+    saved_reps = REPS
+    REPS = 3
+    ms, med, out = timed([BIN, "mutants", "--list", "--diff",
+                          "-d", os.path.join(FIX, name)])
+    REPS = saved_reps
+    results[key] = ms
+    medians[key] = med
+    diff_digests[name] = hashlib.sha256(out.encode()).hexdigest()[:16]
+    print(f"  {name:14s} min={ms:8.1f} ms  median={med:8.1f} ms   "
+          f"diff sha={diff_digests[name]} ({len(out)/1e6:.1f} MB)")
+
 # End-to-end. --jobs 1 keeps scheduling deterministic.
 e2e_dir = os.path.join(FIX, "w4_e2e")
 t = time.perf_counter()
@@ -241,6 +266,13 @@ for name, want in EXPECT_MUTANTS.items():
 for k, want in EXPECT_E2E.items():
     if got_e2e[k] != want:
         errs.append(f"w4_e2e {k}: expected {want}, got {got_e2e[k]}")
+# The unified diffs must stay byte-identical. This is the gate that makes it
+# safe to optimise diff generation: any change to a single byte of any of the
+# 9,640 diffs across these two fixtures fails the run.
+for name, want in EXPECT_DIFF_SHA.items():
+    if diff_digests[name] != want:
+        errs.append(f"{name}: --list --diff digest changed, expected {want}, "
+                    f"got {diff_digests[name]}")
 if errs:
     sys.stderr.write("CORRECTNESS FAILURE:\n  " + "\n  ".join(errs) + "\n")
     sys.exit(1)
@@ -267,12 +299,20 @@ run([BIN, "mutants", "--list", "-d", os.path.join(FIX, "w1_mixed")], env=env)
 spawns = sum(1 for _ in open(log)) if os.path.exists(log) else 0
 print(f"  cargo spawns per discovery run: {spawns}")
 
-total = results["list_mixed_ms"] + results["list_bigfile_ms"] + results["list_manyfiles_ms"]
-total_median = sum(medians.values())
+discovery_total = (results["list_mixed_ms"] + results["list_bigfile_ms"]
+                   + results["list_manyfiles_ms"])
+diff_total = results["diff_mixed_ms"] + results["diff_bigfile_ms"]
 print()
-print("METRIC total_ms=%.1f" % total)
-print("METRIC total_median_ms=%.1f" % total_median)
-for k in ("list_mixed_ms", "list_bigfile_ms", "list_manyfiles_ms"):
+# Primary metric: everything the crate does before a single test is run, which
+# is what "efficiency of the crate" means for a real invocation. Discovery and
+# diff generation are both reported separately so that a regression in the
+# smaller term cannot hide inside the larger one.
+print("METRIC own_ms=%.1f" % (discovery_total + diff_total))
+print("METRIC discovery_total_ms=%.1f" % discovery_total)
+print("METRIC diff_total_ms=%.1f" % diff_total)
+print("METRIC total_median_ms=%.1f" % sum(medians.values()))
+for k in ("list_mixed_ms", "list_bigfile_ms", "list_manyfiles_ms",
+          "diff_mixed_ms", "diff_bigfile_ms"):
     print("METRIC %s=%.1f" % (k, results[k]))
 print("METRIC e2e_ms=%.1f" % e2e_ms)
 print("METRIC cargo_spawns=%d" % spawns)
