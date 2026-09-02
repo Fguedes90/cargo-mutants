@@ -18,17 +18,14 @@
 use std::fmt;
 use std::panic::catch_unwind;
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 
-use anyhow::{Context, anyhow, bail, ensure};
+use anyhow::{Context, anyhow, ensure};
 use camino::{Utf8Path, Utf8PathBuf};
 use itertools::Itertools;
-use serde_json::Value;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use crate::Result;
-use crate::cargo::cargo_bin;
 use crate::console::Console;
 use crate::interrupt::check_interrupted;
 use crate::options::Options;
@@ -225,46 +222,28 @@ impl Workspace {
 }
 
 /// Return the path of the package directory enclosing a given directory.
+///
+/// This is the nearest ancestor of `path`, including `path` itself, that
+/// contains a `Cargo.toml`. That is what `cargo locate-project` reports, but
+/// finding it directly costs a few `stat` calls instead of a subprocess.
+///
+/// The path is canonicalized because the result is compared against paths
+/// from `cargo metadata`, which cargo canonicalizes.
 fn locate_project(path: &Utf8Path) -> Result<Utf8PathBuf> {
     ensure!(path.is_dir(), "{path:?} is not a directory");
-    let args = ["locate-project"];
-    let output = Command::new(cargo_bin())
-        .args(args)
-        .current_dir(path)
-        .output()
-        .with_context(|| format!("failed to spawn {args:?}"))?;
-    let exit = output.status;
-    if !exit.success() {
-        error!(
-            ?exit,
-            "cargo locate-project failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        bail!("cargo locate-project failed");
+    let canonical = path
+        .canonicalize_utf8()
+        .with_context(|| format!("canonicalize {path:?}"))?;
+    let mut dir: &Utf8Path = &canonical;
+    loop {
+        if dir.join("Cargo.toml").is_file() {
+            debug!(?dir, "Found enclosing package directory");
+            return Ok(dir.to_owned());
+        }
+        dir = dir
+            .parent()
+            .ok_or_else(|| anyhow!("no Cargo.toml found in {canonical:?} or any parent"))?;
     }
-    let stdout =
-        String::from_utf8(output.stdout).context("cargo locate-project output is not UTF-8")?;
-    debug!("cargo locate-project output: {}", stdout.trim());
-    let val: Value = serde_json::from_str(&stdout).context("parse cargo locate-project output")?;
-    let cargo_toml_path: Utf8PathBuf = val["root"]
-        .as_str()
-        .with_context(|| format!("cargo locate-project output has no root: {stdout:?}"))?
-        .to_owned()
-        .into();
-    debug!(?cargo_toml_path, "Found workspace root manifest");
-    ensure!(
-        cargo_toml_path.is_file(),
-        "cargo locate-project root {cargo_toml_path:?} is not a file"
-    );
-    let root = cargo_toml_path
-        .parent()
-        .ok_or_else(|| anyhow!("cargo locate-project root {cargo_toml_path:?} has no parent"))?
-        .to_owned();
-    ensure!(
-        root.is_dir(),
-        "apparent project root directory {root:?} is not a directory"
-    );
-    Ok(root)
 }
 
 #[cfg(test)]
