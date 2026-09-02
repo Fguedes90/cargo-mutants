@@ -92,8 +92,15 @@ dominating the profile:
 
 Measured on a fixed three-fixture `--list` benchmark (40-file mixed tree,
 one 304 KB file, 201-file tree; 11,280 mutants total), the sum of the three
-wall times went from 1548.8 ms to 135.7 ms. Mutant discovery output is
-byte-identical throughout, including `--list --json`.
+wall times went from 1548.8 ms to 127.1 ms, a 12.2x reduction. Mutant discovery
+output is byte-identical throughout, including `--list --json`.
+
+Of the 127 ms that remain, roughly 57 ms is startup floor that cargo-mutants
+does not control: `cargo --version` alone costs 17.7 ms against 16.8 ms for
+`cargo metadata --no-deps`, so that cost is cargo's process startup rather than
+metadata work, and `--offline` and `--frozen` do not change it. In what is left,
+`syn` parsing is 42% of a large-file discovery and the rest is spread across
+items no larger than ~9%.
 
 
 ---
