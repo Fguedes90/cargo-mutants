@@ -122,6 +122,13 @@ pr-run-mode = "plan"
 # # Publish jobs to run in CI
 # pr-run-mode = "upload"
 
+# Mutant discovery is CPU-bound in many small calls that cross module and
+# crate boundaries into `syn`/`proc-macro2`, none of which can be inlined with
+# cargo's stock `lto = false, codegen-units = 16`.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 # The profile that 'cargo dist' will build with
 [profile.dist]
 inherits = "release"
