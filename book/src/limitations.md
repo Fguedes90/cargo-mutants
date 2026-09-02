@@ -40,6 +40,12 @@ cargo-mutants does not yet understand conditional compilation, such as
 `#[cfg(target_os = "linux")]`. It will report functions for other platforms as
 missed, when it should know to skip them.
 
+With [`--skip-uncovered`](skip-uncovered.md), doc tests are not run at
+all, because `-Cinstrument-coverage` doesn't reach code compiled by
+`rustdoc`. A function exercised only by a doc test is reported
+`uncovered` in this mode, even though a plain run (without the flag) would
+catch it.
+
 ### Support for other build tools
 
 cargo-mutants currently only works with Cargo, but could in principle be extended to work with other build tools such as Bazel.

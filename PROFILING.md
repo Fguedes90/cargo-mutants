@@ -65,11 +65,11 @@ is not read as a description of current behaviour.
 | # | Finding | Status |
 |---|---|---|
 | 1 | `Span::extract` quadratic | **Fixed.** `span::LineIndex` caches per-file line-start byte offsets on `SourceFile`; span resolution is O(span) instead of O(file). Single 914 KB file: 1404 → 113 ms. |
-| 2 | 50 ms subprocess poll interval | Open. |
-| 3 | `outcomes.json` rewritten per mutant | Open. |
-| 4 | `syn` AST teardown | Open, and now a larger share of what remains: `syn` parsing alone is ~23% of a large-file discovery. Inherent to using `syn`. |
+| 2 | 50 ms subprocess poll interval | **Fixed on Unix.** The child is now reaped by a dedicated waiter thread and the main loop blocks on a channel with the tick interval as its timeout, so exit is observed at once: measured ~2-9 ms instead of a uniform 0-50 ms. Windows still polls: `std` offers no wait-with-timeout for `Child` and adding a Win32 dependency was not worth it. |
+| 3 | `outcomes.json` rewritten per mutant | **Fixed.** Rewrites are throttled to at most one per 500 ms, and `finish()` still writes the complete document, so an interrupted run is at most that stale. The file format is unchanged. |
+| 4 | `syn` AST teardown | Open, and now a larger share of what remains: `syn` parsing alone is ~23% of a large-file discovery. Inherent to using `syn`. The `extra-traits` feature **cannot** be dropped: `src/fnvalue.rs` compares `Option<&syn::Type>` values with `==` in ~14 places and `src/visit.rs` logs `?attr` in two `trace!` calls, all of which need the impls it provides. |
 | 5 | Redundant `cargo locate-project` | **Fixed, and then some.** Both spawns are gone: `cargo metadata` already reports `workspace_root`, and the enclosing package directory is now found by walking up for a `Cargo.toml` instead of shelling out. 3 cargo spawns per discovery run → 1. |
-| 6 | Integration tests run full mutation runs | Open. |
+| 6 | Integration tests run full mutation runs | **Partly fixed.** Three runs that asserted only success were downgraded to `--check`/`--list`, saving 36.9 s of the ~96 s suite (`cross_package_tests` alone went 41.1 → 7.6 s). The rest were examined and must stay: their `.success()` is only reachable if the mutants are really built and caught. |
 
 Four further bottlenecks were found and fixed during that pass, none of which
 are in the table above because they only became visible once #1 stopped

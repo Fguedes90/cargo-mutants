@@ -12,6 +12,16 @@ See also [CONTRIBUTING.md](CONTRIBUTING.md) for more advice on style, approach, 
 
 Actually running subprocesses is delegated to `process.rs`, so that we can later potentially run different build tools to Cargo.
 
+`artifacts.rs` -- Fingerprint a build's test executables, so that a mutant
+whose compiled artifacts are identical to the baseline's or to an earlier
+mutant's can be recognized as equivalent and its test phase skipped
+(`--detect-equivalent-mutants`).
+
+`coverage.rs` -- Measure which source lines the baseline test run executed,
+by instrumenting it and reading the counters with the toolchain's
+`llvm-profdata` and `llvm-cov`, so that a mutant no test executes can be
+reported without building it (`--skip-uncovered`).
+
 `build_dir.rs` -- Manage temporary build directories.
 
 `console.rs` -- colored output to the console including drawing progress bars.

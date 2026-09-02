@@ -27,7 +27,7 @@ The output directory contains:
   unmutated case. The log contains the diff of the mutation plus the output from
   cargo. `outcomes.json` includes for each mutant the name of the log file.
 
-* `caught.txt`, `missed.txt`, `timeout.txt`, `unviable.txt`, each listing mutants with the corresponding outcome.
+* `caught.txt`, `missed.txt`, `timeout.txt`, `unviable.txt`, `equivalent.txt`, `uncovered.txt`, each listing mutants with the corresponding outcome.
 
 * `previously_caught.txt` accumulates a list of mutants caught in previous runs with [`--iterate`](iterate.md).
 

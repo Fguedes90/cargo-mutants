@@ -40,11 +40,18 @@ More mutation genres and patterns will be added in future releases.
 | `bool`            | `true`, `false` |
 | `String`          | `String::new()`, `"xyzzy".into()` |
 | `&'_ str` .       | `""`, `"xyzzy"` |
+| `char`            | `'\0'`, `'x'` |
+| `PathBuf`, `Utf8PathBuf` | `PathBuf::new()`, `PathBuf::from("xyzzy")` |
+| `OsString`        | `OsString::new()`, `OsString::from("xyzzy")` |
+| `Duration`        | `Duration::ZERO`, `Duration::from_secs(1)` |
+| `cmp::Ordering`   | `Ordering::Less`, `Ordering::Equal`, `Ordering::Greater` |
+| enum declared in the same file | each unit variant, e.g. `Colour::Red` |
+| `Range<T>`        | `Default::default()` |
 | `&T`              | `Box::leak(Box::new(...))` |
 | `&mut T`          | `Box::leak(Box::new(...))` |
 | `&[T]`            | `Vec::leak(...)` |
 | `&mut [T]`            | `Vec::leak(...)` |
-| `Result<T>`       | `Ok(...)` , [and an error if configured](error-values.md)  |
+| `Result<T, E>`    | `Ok(...)`, `Err(...)` when `E` is a type whose values can be constructed directly (such as `String`), [and an error if configured](error-values.md) |
 | `Option<T>`       | `Some(...)`, `None` |
 | `Box<T>`          | `Box::new(...)`                                            |
 | `Vec<T>`          | `vec![]`, `vec![...]`                                      |
@@ -60,6 +67,7 @@ More mutation genres and patterns will be added in future releases.
 | `(A, B, ...)`     | `(a, b, ...)` for the product of all replacements of A, B, ... |
 | `impl Iterator`   | Empty and one-element iterators of the inner type           |
 | (any other)       | `Default::default()`                                       |
+| `dyn Trait`, `Pin`, `NonNull`, `Instant`, `SystemTime` | no mutants: no value of these types can be constructed here |
 
 `...` in the mutation patterns indicates that the type is recursively mutated.
  For example, `Result<bool>` can generate `Ok(true)` and `Ok(false)`.
@@ -83,8 +91,8 @@ like `a == 0`.
 | `\|\|`   | `&&`,              |
 | `<`      | `==`, `>`          |
 | `>`      | `==`, `<`          |
-| `<=`     | `>`                |
-| `>=`     | `<`                |
+| `<=`     | `>`, `<`           |
+| `>=`     | `<`, `>`           |
 | `+`      | `-`, `*`           |
 | `-`      | `+`, `/`           |
 | `*`      | `+`, `/`           |
@@ -106,11 +114,68 @@ too prone to generate false positives, for example when unsigned integers are co
 
 The bitwise assignment operators `&=` and `|=` are not mutated to `^=` because in code that accumulates bits (e.g., `bitmap |= new_bits`), `|=` and `^=` produce the same result when starting from zero, making such mutations uninformative.
 
+Mutating `x <= 0` to `x < 0` on an unsigned type triggers the `unused_comparisons`
+lint, which is an error in trees that deny warnings, so the mutant is counted as
+unviable. See [lints](lints.md) for `--cap-lints`.
+
 ## Unary operators
 
 Unary operators are deleted in expressions like `-a` and `!a`.
 They are not currently replaced with other unary operators because they are too prone to
 generate unviable cases (e.g. `!1.0`, `-false`).
+
+## If conditions
+
+The condition of an `if` expression is replaced with `true` and `false`, checking
+that the tests exercise both sides of the branch.
+
+`if let` conditions are not mutated because they are not `bool`. A condition that
+is already a literal is covered by [bool literals](#bool-literals) instead.
+
+The `false` mutant is not generated when the `if` body contains `break` or
+`continue`, because that condition is how an enclosing loop ends, and removing
+the only exit hangs the test rather than failing it.
+
+## While conditions
+
+The condition of a `while` expression is replaced with `false`, so the loop body
+never runs. It is not replaced with `true`, which would loop forever.
+
+## Bool literals
+
+`true` and `false` literals are replaced with each other, in expressions like
+`let debug = false;`.
+
+Literals in patterns are not mutated, because replacing `true` with `false` in
+`match b { true => .., false => .. }` makes the match non-exhaustive. Literals
+inside attributes are never mutated. A literal that is the entire function body
+or an entire match arm guard is left to the `FnValue` and `MatchArmGuard` genres,
+which generate the same mutant.
+
+## Statement deletion
+
+Statements whose value is discarded are deleted, in code like
+`v.push(1);` or `self.count = n;`. This checks that the tests observe the effect
+of each statement.
+
+Only calls, method calls, and plain assignments are deleted. Compound
+assignments such as `n -= 1` are not, since they are often the step of a loop and
+deleting them hangs the test. A statement is also kept when it is the only
+constraint on the type of a `let` binding without a type annotation, as in
+`let mut v = Vec::new(); v.push(1u32);`, where deleting it would leave the type
+uninferable, and when it calls a function excluded by
+[`--skip-calls`](skip_calls.md).
+
+## Return values
+
+The value of an explicit `return` is replaced with values guessed from the
+function's declared return type, using the same patterns as
+[`FnValue`](#replace-function-body-with-value). This checks that the tests
+distinguish early returns from the value the function otherwise produces.
+
+`return` inside a closure or `async` block is not mutated, because its type is
+usually inferred and so unknown here. A function whose whole body is
+`return expr;` is left to `FnValue`, which generates the same mutant.
 
 ## Match arms
 
