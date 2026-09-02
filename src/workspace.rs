@@ -90,22 +90,22 @@ impl Workspace {
 
     /// Open the workspace containing a given directory.
     pub fn open<P: AsRef<Path>>(start_dir: P) -> Result<Self> {
-        let start_dir = start_dir.as_ref();
-        let dir = locate_project(start_dir.try_into().expect("start_dir is UTF-8"), true)?;
-        assert!(
-            dir.is_absolute(),
-            "project location {dir:?} is not absolute"
-        );
-        let manifest_path = dir.join("Cargo.toml");
-        debug!(?manifest_path, "Find workspace metadata");
+        let start_dir: &Utf8Path = start_dir
+            .as_ref()
+            .try_into()
+            .expect("start_dir is UTF-8");
+        ensure!(start_dir.is_dir(), "{start_dir:?} is not a directory");
+        debug!(?start_dir, "Find workspace metadata");
         check_interrupted()?;
+        // Cargo locates the enclosing manifest itself and reports the workspace
+        // root in its output, so there is no need to spawn a separate
+        // `cargo locate-project --workspace` beforehand.
         let metadata = cargo_metadata::MetadataCommand::new()
             .no_deps()
-            .manifest_path(&manifest_path)
-            .current_dir(&dir)
+            .current_dir(start_dir)
             .verbose(false)
             .exec()
-            .with_context(|| format!("Failed to run cargo metadata on {manifest_path}"))?;
+            .with_context(|| format!("Failed to run cargo metadata in {start_dir}"))?;
         debug!(workspace_root = ?metadata.workspace_root, "Found workspace root");
         let packages = packages_from_metadata(&metadata);
         debug!(?packages, "Found packages");
@@ -134,7 +134,7 @@ impl Workspace {
             PackageFilter::Auto(dir) => {
                 let root = self.root();
                 // Find the closest package directory (with a cargo manifest) to the current directory.
-                let package_dir = locate_project(dir, false)?;
+                let package_dir = locate_project(dir)?;
                 assert!(package_dir.is_absolute());
                 // It's not required that the members be inside the workspace directory: see
                 // <https://doc.rust-lang.org/cargo/reference/workspaces.html>
@@ -224,15 +224,12 @@ impl Workspace {
     }
 }
 
-/// Return the path of the workspace or package directory enclosing a given directory.
-fn locate_project(path: &Utf8Path, workspace: bool) -> Result<Utf8PathBuf> {
+/// Return the path of the package directory enclosing a given directory.
+fn locate_project(path: &Utf8Path) -> Result<Utf8PathBuf> {
     ensure!(path.is_dir(), "{path:?} is not a directory");
-    let mut args: Vec<&str> = vec!["locate-project"];
-    if workspace {
-        args.push("--workspace");
-    }
+    let args = ["locate-project"];
     let output = Command::new(cargo_bin())
-        .args(&args)
+        .args(args)
         .current_dir(path)
         .output()
         .with_context(|| format!("failed to spawn {args:?}"))?;
