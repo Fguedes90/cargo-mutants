@@ -176,6 +176,9 @@ EXPECT_E2E = {"outcomes": 24, "caught": 22, "missed": 1}
 # that any change to the generated unified diffs is a hard failure.
 EXPECT_DIFF_SHA = {"w1_mixed": "32a7997e11a31a86",
                    "w2_bigfile": "16af60bc09d9503c"}
+# Same, for the `--list --json` rendering that `mutants.json` uses.
+EXPECT_JSON_SHA = {"w1_mixed": "ad96543fdb4352b7",
+                   "w2_bigfile": "baea50505f3d2f11"}
 # 21 reps, not a handful: the many-small-files workload spawns one thread per
 # file, and its wall time is broad and right-skewed (measured spread ~37-46 ms
 # for one fixed binary). A min-of-5 on that distribution does not converge and
@@ -239,6 +242,54 @@ for key, name in (("diff_mixed_ms", "w1_mixed"),
     print(f"  {name:14s} min={ms:8.1f} ms  median={med:8.1f} ms   "
           f"diff sha={diff_digests[name]} ({len(out)/1e6:.1f} MB)")
 
+# Peak memory, and the `--list --json` rendering that drives the worst of it.
+#
+# `mutants.out/mutants.json` carries every mutant with its diff, so the JSON
+# path is the high-water mark of the whole program: it is what a large real
+# tree makes cargo-mutants hold in memory before any test runs. Measured with
+# `/usr/bin/time -l`, whose "peak memory footprint" is the phys_footprint of
+# the child, in a dedicated run so the timing above is not perturbed.
+json_digests = {}
+peaks = {}
+
+
+def peak_bytes(args):
+    """Peak physical footprint of one child process, in bytes."""
+    r = subprocess.run(["/usr/bin/time", "-l"] + args,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.stderr.write("peak workload failed: %s\n%s\n" % (args, r.stderr[-2000:]))
+        sys.exit(1)
+    for line in r.stderr.splitlines():
+        if "peak memory footprint" in line:
+            return int(line.split()[0]), r.stdout
+    sys.stderr.write("could not parse peak memory from:\n%s\n" % r.stderr[-2000:])
+    sys.exit(1)
+
+
+for key, name, flags in (("json_mixed", "w1_mixed", ["--list", "--json"]),
+                         ("json_bigfile", "w2_bigfile", ["--list", "--json"]),
+                         ("diff_bigfile", "w2_bigfile", ["--list", "--diff"]),
+                         ("list_bigfile", "w2_bigfile", ["--list"])):
+    nbytes, out = peak_bytes([BIN, "mutants"] + flags + ["-d", os.path.join(FIX, name)])
+    peaks[key] = nbytes / 1e6
+    if flags == ["--list", "--json"]:
+        json_digests[name] = hashlib.sha256(out.encode()).hexdigest()[:16]
+        print(f"  {key:14s} peak={peaks[key]:8.1f} MB  "
+              f"json sha={json_digests[name]} ({len(out)/1e6:.1f} MB)")
+    else:
+        print(f"  {key:14s} peak={peaks[key]:8.1f} MB")
+
+# Timed separately from the peak run above: this is the same rendering that
+# `mutants.json` uses, so its cost belongs in the metric too.
+saved_reps = REPS
+REPS = 3
+results["json_bigfile_ms"], medians["json_bigfile_ms"], _ = timed(
+    [BIN, "mutants", "--list", "--json", "-d", os.path.join(FIX, "w2_bigfile")])
+REPS = saved_reps
+print(f"  {'json_bigfile':14s} min={results['json_bigfile_ms']:8.1f} ms  "
+      f"median={medians['json_bigfile_ms']:8.1f} ms")
+
 # End-to-end. --jobs 1 keeps scheduling deterministic.
 e2e_dir = os.path.join(FIX, "w4_e2e")
 t = time.perf_counter()
@@ -273,6 +324,13 @@ for name, want in EXPECT_DIFF_SHA.items():
     if diff_digests[name] != want:
         errs.append(f"{name}: --list --diff digest changed, expected {want}, "
                     f"got {diff_digests[name]}")
+# `mutants.json` is a public output format, and its keys come out sorted
+# because they go through a `serde_json::Value`. Optimising that path must not
+# reorder or drop a single byte, so it is pinned the same way.
+for name, want in EXPECT_JSON_SHA.items():
+    if json_digests[name] != want:
+        errs.append(f"{name}: --list --json digest changed, expected {want}, "
+                    f"got {json_digests[name]}")
 if errs:
     sys.stderr.write("CORRECTNESS FAILURE:\n  " + "\n  ".join(errs) + "\n")
     sys.exit(1)
@@ -303,16 +361,20 @@ discovery_total = (results["list_mixed_ms"] + results["list_bigfile_ms"]
                    + results["list_manyfiles_ms"])
 diff_total = results["diff_mixed_ms"] + results["diff_bigfile_ms"]
 print()
-# Primary metric: everything the crate does before a single test is run, which
-# is what "efficiency of the crate" means for a real invocation. Discovery and
-# diff generation are both reported separately so that a regression in the
-# smaller term cannot hide inside the larger one.
-print("METRIC own_ms=%.1f" % (discovery_total + diff_total))
+# Primary metric: the high-water mark of memory across the renderings a real
+# run performs before testing starts. `mutants.json` holds every mutant with
+# its diff, so this is what a large tree actually costs to prepare.
+print("METRIC peak_rss_mb=%.1f" % max(peaks.values()))
+for k in sorted(peaks):
+    print("METRIC peak_%s_mb=%.1f" % (k, peaks[k]))
+# Time is now a guard: it must not regress to buy memory back.
+print("METRIC own_ms=%.1f" % (discovery_total + diff_total
+                              + results["json_bigfile_ms"]))
 print("METRIC discovery_total_ms=%.1f" % discovery_total)
 print("METRIC diff_total_ms=%.1f" % diff_total)
 print("METRIC total_median_ms=%.1f" % sum(medians.values()))
 for k in ("list_mixed_ms", "list_bigfile_ms", "list_manyfiles_ms",
-          "diff_mixed_ms", "diff_bigfile_ms"):
+          "diff_mixed_ms", "diff_bigfile_ms", "json_bigfile_ms"):
     print("METRIC %s=%.1f" % (k, results[k]))
 print("METRIC e2e_ms=%.1f" % e2e_ms)
 print("METRIC cargo_spawns=%d" % spawns)
