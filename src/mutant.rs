@@ -644,6 +644,77 @@ mod test {
     use crate::visit::mutate_source_str;
     use crate::*;
 
+    /// The whole-file diff that [`Mutant::diff`] must reproduce by diffing
+    /// only a window around the mutated span.
+    fn whole_file_diff(mutant: &Mutant) -> String {
+        mutant.unified_diff(mutant.source_file.code(), &mutant.mutated_code())
+    }
+
+    /// Diffing only a window around the span must give byte-identical output
+    /// to diffing the whole file, including the hunk line numbers.
+    ///
+    /// The sources below put the mutation at the start and end of the file, in
+    /// a file shorter than the context radius, after multi-byte characters, and
+    /// among repeated identical lines where the diff alignment is ambiguous —
+    /// which is where a window could legitimately disagree with the whole file.
+    #[test]
+    fn windowed_diff_matches_whole_file_diff() {
+        let pad = "// pad\n".repeat(20);
+        let long_body = (0..40).map(|i| format!("    let v{i} = {i};\n")).join("");
+        let sources = [
+            // Mutation on the first line: the window is clamped to the file
+            // start, so the hunks need no renumbering.
+            format!("pub fn a(x: i32) -> i32 {{ x + 1 }}\n{pad}"),
+            // Mutation on the last line, with no trailing newline.
+            format!("{pad}pub fn z(x: i32) -> i32 {{ x + 1 }}"),
+            // Whole file shorter than the context radius.
+            "pub fn t(x: i32) -> bool { x > 0 }\n".to_owned(),
+            // A span covering many lines, so the window is wider than the
+            // context radius on both sides.
+            format!("{pad}pub fn big() -> i32 {{\n{long_body}    42\n}}\n{pad}"),
+            // Multi-byte characters before the span: byte offsets and column
+            // numbers disagree from here on.
+            format!("// áéíóú 你好 🎉\n{pad}pub fn u(x: i32) -> i32 {{ x + 1 }}\n{pad}"),
+            // Adjacent mutable functions among repeated identical lines.
+            format!(
+                "{pad}pub fn p(x: i32) -> i32 {{ x + 1 }}\n\
+                 pub fn q(x: i32) -> i32 {{ x - 1 }}\n{pad}"
+            ),
+        ];
+        let options = Options::default();
+        let mut compared = 0;
+        for source in &sources {
+            let mutants = mutate_source_str(source, &options).unwrap();
+            assert!(!mutants.is_empty(), "no mutants in {source:?}");
+            for mutant in &mutants {
+                assert_eq!(
+                    mutant.cached_diff(),
+                    whole_file_diff(mutant),
+                    "windowed diff differs from whole-file diff for {}",
+                    mutant.full_name()
+                );
+                compared += 1;
+            }
+        }
+        assert!(compared >= 30, "only {compared} mutants compared");
+    }
+
+    /// Only genuine hunk headers are renumbered. A body line that looks like
+    /// one, which can happen when the mutated source is itself a diff, must be
+    /// passed through untouched.
+    #[test]
+    fn renumber_hunks_leaves_non_headers_alone() {
+        use super::renumber_hunks;
+        assert_eq!(
+            renumber_hunks("@@ -1,3 +1,3 @@\n-@@ -9,9 +9,9 @@\n+@@ not a header\n", 10),
+            "@@ -11,3 +11,3 @@\n-@@ -9,9 +9,9 @@\n+@@ not a header\n"
+        );
+        // An empty side is numbered from line 0, which has nowhere to move.
+        assert_eq!(renumber_hunks("@@ -0,0 +1 @@\n", 5), "@@ -0,0 +6 @@\n");
+        // A zero offset means the window started at the file start.
+        assert_eq!(renumber_hunks("@@ -1,3 +1,3 @@\n", 0), "@@ -1,3 +1,3 @@\n");
+    }
+
     #[test]
     fn squash_lines() {
         use super::squash_lines;

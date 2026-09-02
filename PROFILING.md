@@ -146,6 +146,52 @@ against cargo's own 19.0 ms) and about 10 ms is clap building its command tree
 (`cargo-mutants --version`, which does no work at all, costs 4.5 ms). Most of
 the rest is `syn` parsing and the AST teardown behind it.
 
+### The largest remaining cost was not in discovery at all
+
+The passes above measured `--list`, which does not generate diffs. Widening the
+benchmark to everything cargo-mutants does before the first test runs — that
+is, adding `--list --diff`, since `mutants.out/mutants.json` carries a unified
+diff for every mutant and is written before any of them is tested — found a
+cost an order of magnitude larger than all of discovery:
+
+| Workload | Before | After |
+|---|---|---|
+| 300 KB file, 7,600 mutants | 4531 ms | 114 ms |
+| 40-file mixed tree, 2,040 mutants | 42.5 ms | 45.2 ms |
+
+`Mutant::diff` called `TextDiff::from_lines(whole_file, whole_mutated_file)`,
+so `similar` tokenized and hashed every line of both sides for every mutant,
+and `mutated_code()` allocated a full copy of the file just to be diffed. The
+cost therefore grew with *mutants x file size*: `tokenize_lines` was 55.6% of
+self time on the large fixture, with another ~20% in SipHash and 8% in
+hashbrown, and the profile was dominated by work whose result was discarded.
+
+This is the same shape as finding #1 above — `Span::extract` making discovery
+quadratic — relocated into the diff path, where every real run pays it.
+
+Only the mutated span plus the context radius can appear in a unified diff;
+lines further away are identical on both sides. `diff` now builds just that
+window, diffs it, and renumbers the hunk headers to the positions a whole-file
+diff would have reported. The mutated side is built for the window alone, so
+the whole mutated file is no longer materialised to be diffed — which also
+removed the second `mutated_code()` call per tested mutant that the earlier
+notes flagged.
+
+The equivalence is not obvious and is worth stating: windowing could change
+which alignment `similar` picks when lines repeat. It was verified byte-for-byte
+on 46 `testdata` trees, cargo-mutants' own tree (2.27 MB of diffs), three
+generated fixtures (13.2 MB), hand-built edge cases (mutation on the first and
+last line, no trailing newline, CRLF, multi-byte characters before the span, a
+file shorter than the context radius, a 69 KB multi-hunk body), and 300
+generated sources built from a deliberately tiny pool of repeated lines so that
+the alignment is ambiguous (3.88 MB of diffs). Zero mismatches. The property is
+pinned by `windowed_diff_matches_whole_file_diff`, which compares the windowed
+diff against a whole-file diff for every mutant of six edge-case sources; an
+off-by-one in either window boundary, or dropping the renumbering, fails it.
+
+After this, the large-file fixture's profile collapsed from 44,875 samples to
+132, and `--list --diff` on it is no longer dominated by anything of ours.
+
 ### Measurement discipline, again
 
 The many-small-files workload has a broad, right-skewed wall-time distribution
